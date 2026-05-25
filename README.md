@@ -2,19 +2,30 @@
 
 A two-stage pipeline for **structural similarity search** over small molecules.
 
-**Stage 1 — `mol_struct_ae`**: a multi-track autoencoder that learns a single
-latent from five complementary views of each molecule:
+**Stage 1 — `mol_struct_ae`**: a **Pairformer-based** structural autoencoder
+modelled on AlphaFold-3. Two unified representations are updated jointly at
+every block:
 
-   1. **2D graph** — atom and bond features, encoded with GAT
-   2. **3D geometry** — bond lengths, bond angles, encoded with an SE(3)-invariant MPNN (RBF on distances/angles only — no raw xyz)
-   3. **Charge** — per-atom Gasteiger partial charges, encoded with an MLP
-   4. **Pharmacophore** — per-atom donor/acceptor/aromatic/etc. labels, encoded with MLP + transformer
-   5. **Torsion / dihedral angles** — signed dihedrals over 4-atom quadruples, encoded with an MLP that scatters back to atoms
+   - **`single_repr [B, N, d_single]`** — one vector per atom. Carries atom
+     identity (atomic number, hybridization, …), atom types (radii, mass,
+     …), Gasteiger partial charges, and pharmacophore flags.
+   - **`pair_repr [B, N, N, d_pair]`** — one vector per atom pair. Carries
+     **all geometric information** at every relevant bond-hop distance:
+     1-bond (adjacency, bond features, bond lengths), 2-bond (bond angles
+     scattered into `pair[i, k]`), and 4-bond (signed dihedrals scattered
+     into `pair[i, l]`).
 
-The tracks talk to each other through per-atom cross-attention + a global
-track-token transformer. The result is one 256-D latent `z` (and its
+The Pairformer processes both atom and bond representations through 4 blocks of OuterProductMean (single → pair), TriangleAttention (pair self-
+update), and AttentionWithPairBias (pair → single). All input geometry, atom
+identity, and chemical labels live in one of two tensors instead of having
+their own encoders.
+
+Modelled on AlphaFold-3's Pairformer: a stack of 4 blocks where the per-atom
+`single_repr` and per-pair `pair_repr` update each other at every layer
+(OuterProductMean, TriangleAttention, AttentionWithPairBias).
+The post-Pairformer `single_repr` is pooled to a 256-D latent `z` (and its
 L2-normalized projection `sim_embed`) per molecule. Reconstruction losses on
-every track + cross-track-consistency keep the latent informative.
+every track keep the latent informative.
 
 **Stage 2 — `distillation`**: a small SMILES-only transformer trained to
 reproduce `mol_struct_ae`'s `sim_embed` directly from the SMILES string. Once
@@ -37,7 +48,7 @@ charge calc — just a SMILES tokenizer + a small transformer.
 
 This document covers:
 
-1. [Architecture](#architecture) — the five `mol_struct_ae` tracks, the cross-attention fusion, the latent, and the per-track decoders. Plus the `distillation` model.
+1. [Architecture](#architecture) — the Pairformer-based encoder (single + pair representations updated jointly at every block, AF3-style), the latent, and the per-track decoders. Plus the `distillation` model.
 2. [Data format](#data-format) — what a `MolSample` and a `MolBatch` contain.
 3. [Featurization](#featurization) — how raw molecules are turned into `MolSample`s and sharded to disk.
 4. [Training](#training) — stage 1 (mol_struct_ae) and stage 2 (distillation).
@@ -50,110 +61,151 @@ This document covers:
 
 ## Architecture
 
+The encoder is a **Pairformer** modelled on AlphaFold-3's Pairformer. Two
+unified representations — *single* (per-atom) and *pair* (per-atom-pair) —
+update jointly at every block. 
+
 ```
-  ┌──────────────────────────── INPUT ────────────────────────────────┐
-  │  2D graph  |  bond lengths+angles  |  partial charges  |  pharma  |  torsion  │
+  ┌────────────────────────── INPUT TRACKS ───────────────────────────┐
+  │  atom_feats_2d   atom_types   partial_charges   pharma            │
+  │  adj_2d   bond_feats_2d   bond_lengths   bond_angles   dihedrals  │
   └───────────────────────────────────────────────────────────────────┘
-       │                   │                   │              │            │
-       ▼                   ▼                   ▼              ▼            ▼
-      GAT           SE(3)-invariant          MLP            MLP +        MLP
-                       MPNN                               Transformer-
-                  (RBF distances                           encoder
-                   + angles)
-       │                   │                   │              │            │
-       └───────────────────┴──────┬────────────┴──────────────┴────────────┘
-                                   ▼
-               Per-atom cross-attention  (×L)          ← 4 atom-aligned tracks
-               (2D, 3D, pharma, torsion attend to each other per atom)
-                                   │
-        ┌──────────────────────────┴────────────────┐
-        ▼                                           ▼
-    Pool per track → 5 track tokens        (charge token joins here)
-                                   │
-                                   ▼
-               Track-token transformer (CLS+5)          ← global fusion
-                                   │
-                                   ▼
-                         μ, log σ²  → reparam → z (latent)
-                                   │
-        ┌──────────────┬───────────┴──────┬──────────────┬─────────────┐
-        ▼              ▼                  ▼              ▼             ▼
-    2D recon      3D recon           charge recon    pharma recon   torsion recon
-    (atom feats,  (atype, bond len,  (per-atom q)    (per-atom)     (sin φ, cos φ)
-     adj, bond)    bond angle)
+                              │
+                              ▼
+                     InputEmbedder
+              (per-atom inputs → single_repr [B, N, d_single])
+              (per-pair inputs → pair_repr   [B, N, N, d_pair])
+                              │
+                              ▼
+                   ┌── PairformerBlock × 4 ──┐
+                   │                          │
+                   │  ① pair += OuterProductMean(single)
+                   │  ② pair += TriangleAttention(pair)
+                   │  ③ pair += PairTransition(pair)
+                   │  ④ single += AttnWithPairBias(single, pair)
+                   │  ⑤ single += SingleTransition(single)
+                   │                          │
+                   └──────────────────────────┘
+                              │
+                              ▼
+                     GlobalAggregator
+              ├──→ CLS-pool(single) → μ, log σ²  → reparam → z
+              └──→ 5 learned-query context tokens for decoders
+                              │
+                              ▼
+                  AtomQueryDecoder (z + context → slot_h [B, N, d])
+                              │
+       ┌──────────────┬──────┴──────────┬──────────────┬─────────────┐
+       ▼              ▼                 ▼              ▼             ▼
+    2D recon      3D recon         charge recon   pharma recon   torsion recon
+    (atom feats,  (atype, bond     (per-atom q)   (per-atom)     (sin φ, cos φ)
+     adj, bond)    len, bond ang)
 ```
 
-### The five tracks
+### The Pairformer block
 
-Each track is an encoder–decoder pair that consumes and reconstructs one view
-of the molecule. They are run **in parallel** and stitched together through
-cross-attention.
+At every block, single and pair representations exchange information bidirectionally:
 
-| Track | Inputs | Encoder | Per-atom features? | Decoder output |
-|---|---|---|---|---|
-| **2D graph** | atom features (atomic num, charge, hybridization, …), bond features (type, stereo, in-ring), edge index | Dense **GATConv** with edge features (`DenseGATLayer`), multi-head additive attention with atoms only attending to connected atoms | yes | atom features, adjacency (BCE), bond features |
-| **3D geometry** | atom types, bond lengths, bond angles, angle index | SE(3)-invariant MPNN: pair messages weighted by `RBF(bond_length)`, angle messages weighted by `RBF(bond_angle)` aggregated over atom triplets (i,j,k). Raw xyz coords are **not** used in the encoder — they would break rotation invariance. | yes | atom types, bond lengths, bond angles |
-| **Charge** | per-atom Gasteiger partial charges `[N]` | Small MLP on the scalar charge per atom. A voxel-grid CNN path was considered but removed: PCA-canonicalized grids are not consistently oriented across structurally similar molecules (adding one atom shifts the PCA frame arbitrarily), so the grid introduced noisy training signal. Per-atom charges are fully SE(3)-invariant by construction. | yes | per-atom charges (MSE) |
-| **Pharmacophore** | per-atom binary labels: donor, acceptor, aromatic, hydrophobic, ±charge, halogen, ring | Small transformer over atoms | yes | per-atom binary labels (BCE) |
-| **Torsion / dihedral** | dihedral index `[T,4]`, signed dihedral angles `[T]` | MLP that takes inputs `(h_i, h_j, h_k, h_l, RBF(cos φ), RBF(sin φ))`, then scatters output back to atoms (mean over torsions each atom is in) | yes (after scatter) | (sin φ, cos φ) per torsion |
+| Step | Op | Function |
+|------|----|----------|
+| ① | `OuterProductMean` | single → pair: for each pair (i,j), use outer-product of low-dim projections of single[i] and single[j] |
+| ② | `TriangleAttentionStartingNode` | pair self-update: for each (i,j), attend over k with bias from pair[k,j] — captures 3-atom geometry through pair_repr |
+| ③ | `PairTransition` | pair MLP — feed-forward on the pair tensor |
+| ④ | `SingleAttentionWithPairBias` | pair → single: standard single self-attention where pair_repr biases attention logits — pair information flows back into per-atom representation |
+| ⑤ | `SingleTransition` | single MLP — feed-forward on the single tensor |
 
-**Why these five?** They cover the natural hierarchy of molecular descriptors:
-2-atom (bonds + lengths), 3-atom (bond angles), 4-atom (dihedrals), per-atom
-electronic (partial charges), and binary chemical labels (pharmacophore). The
-2D graph is the topological backbone; the rest are geometric/electronic/chemical
-layers on top of it. Together they encode far more than Tanimoto fingerprints.
+Each step is a **residual update with pre-LayerNorm** and (for the attention
+modules) a sigmoid gate on the output, following AF3's design. The whole
+block is one "communication round" between the two representations.
 
-**SE(3) invariance.** All encoder inputs are either topology-based (2D graph,
-pharmacophore labels) or SE(3)-invariant scalars (bond lengths, bond angles,
-dihedral angles, partial charges). No raw xyz coordinates enter any encoder.
-This means two conformers of the same molecule that differ only by a global
+### Input embedding
+
+Every input from the featurization is mapped into either `single_repr` (per
+atom) or `pair_repr` (per atom pair) at a single input embedder:
+
+| Input | Goes into | How |
+|-------|-----------|-----|
+| `atom_feats_2d` (32-D) | single | linear embedding |
+| `atom_types` (16-D) | single | linear embedding |
+| `partial_charges` (scalar) | single | linear embedding of unsqueezed scalar |
+| `pharma_feats` (8-D binary) | single | linear embedding |
+| `adj_2d` (0/1) | pair (1-bond) | small embedding table |
+| `bond_feats_2d` (8-D) | pair (1-bond) | linear embedding |
+| `bond_lengths` (scalar Å) | pair (1-bond) | RBF(0–5 Å) → linear, gated by adj_2d |
+| `bond_angles` (radians) | pair (2-bond) | **Sparse scatter** of RBF(0–π) into pair[i, k] (and pair[k, i]) for every angle triple (i, j, k). Multiple j's connecting the same (i, k) accumulate additively. |
+| `dihedral_angles` (signed φ) | pair (4-bond) | **Sparse scatter** of `[RBF(cos φ), RBF(sin φ)]` into pair[i, l] (and pair[l, i]) for every dihedral quad (i, j, k, l). |
+
+All five complementary views of the molecule (topology, 3D geometry, partial
+charges, pharmacophore labels, dihedrals) are summed into these two tensors,
+then processed jointly by the Pairformer backbone.
+
+**SE(3) invariance.** All Pairformer inputs are either topology-based (2D
+graph, pharmacophore labels) or SE(3)-invariant scalars (bond lengths, bond
+angles, dihedral angles, partial charges). No raw xyz coordinates enter the
+model. Two conformers of the same molecule that differ only by a global
 rotation or translation produce identical latent vectors.
 
-### Cross-attention and fusion
+### Sizing
 
-Two stages, both in [cross_attention.py](mol_struct_ae/cross_attention.py).
+The default `MolAEConfig` is sized for a 24-GB A10G at max_atoms=96:
 
-1. **Per-atom cross-attention** (`PerAtomCrossAttention`, ×L layers). The four
-   tracks that are atom-aligned — 2D, 3D, pharma, torsion — all have shape
-   `[B, N, d]` with the *same atom indexing*. For each track in turn, every
-   atom queries the same atom's representations in the other three tracks
-   (concatenated as keys/values). This is followed by a feed-forward + norm.
-   The result: each track's per-atom hidden states are aware of what the other
-   tracks "saw" at that atom.
+| Component | Default | Note |
+|-----------|--------:|------|
+| `d_single` (`hidden_dim`) | 128 | per-atom hidden dim |
+| `d_pair` | 32 | per-pair hidden dim — keep small (×N² in memory) |
+| `latent_dim` | 256 | output latent + sim_embed dim |
+| `num_pairformer_blocks` | 4 | depth of the backbone |
+| `heads` | 4 | attention heads (used in triangle + single attn) |
+| `num_context_tokens` | 5 | learned-query tokens fed to decoders |
+| Parameter count | ~3–5 M | depends on `hidden_dim` |
 
-   The charge track is also atom-aligned (per-atom MLP output) and participates
-   in this stage.
+### Comparison to AF3
 
-2. **Track-token fusion** (`TrackTokenFusion`). Each of the five tracks is
-   pooled to a `[B, d]` token. A CLS token is prepended and a small transformer
-   encoder mixes everything. The CLS output goes through a μ / log σ² head →
-   reparameterized → latent `z`. The post-fusion track tokens are kept around
-   and fed back into the decoders as cross-attention memory.
+Ours is a **Pairformer-lite** — same qualitative pattern but smaller:
 
-The fusion is **light VAE-style**: KL is in the loss but at a very small weight
-(`1e-3`), so the latent is mostly deterministic. The point is regularization,
-not generation.
+| Component | AF3 Pairformer | Ours |
+|-----------|---------------|------|
+| Single update | row + column attention with pair bias | single self-attention with pair bias |
+| Pair update | triangle attention (both starting + ending node) + triangle multiplication | only triangle attention (starting node) |
+| Depth | 48 blocks | 4 blocks |
+| `d_pair` | 128 | 32 |
+| `d_single` | 384 | 128 |
+
+Triangle multiplication and ending-node triangle attention add ~3× compute
+per block in full AF3 but produce diminishing returns at our scale. The
+reduced design keeps the *qualitative* AF3 pattern (interleaved single + pair
+updates with triangle attention) and fits in our compute budget at N=96 on
+A10G.
 
 ### Latent and similarity head
 
-The latent `z ∈ ℝ^d_latent` is passed through a small `sim_proj` MLP to produce
-`sim_embed`, the embedding used for contrastive learning and inference-time
-cosine similarity. Keeping the projection separate from `z` lets the latent
-serve reconstruction without being collapsed to a contrastive surface.
+After the Pairformer, `GlobalAggregator` pools `single_repr`:
+- **CLS-pool** (masked mean of a learned projection of single_repr) → `μ`,
+  `log σ²` heads → reparameterize → latent `z ∈ ℝ^256`. KL is in the loss
+  at very small weight (1e-3), so `z` is mostly deterministic — the VAE
+  regularizer is for shape, not generation.
+- **5 learned-query context tokens** that attend over `single_repr` via
+  multi-head cross-attention. These feed the decoders.
+
+A small `sim_proj` MLP maps `z` → `sim_embed`, the L2-normalised 256-D vector
+used for inference-time cosine similarity. Keeping `sim_proj` separate from
+`z` lets the latent serve reconstruction without being collapsed to a
+contrastive surface.
 
 ### Decoders
 
 All decoders condition on `z` via a shared `AtomQueryDecoder`: `max_atoms`
-learned query vectors cross-attend to `[z, fused_track_tokens]` and produce
-`max_atoms` "slot" hidden vectors plus a per-slot atom-existence logit. Each
-track decoder then maps slots to its reconstruction target — atom-level heads
-read individual slots, pair-level heads read symmetric outer products
-(`hi ⊕ hj`), triple-level heads (bond angles) read three-way concatenations.
+learned query vectors cross-attend to `[z, *context_tokens]` (5 context
+tokens from `GlobalAggregator`) and produce `max_atoms` "slot" hidden
+vectors plus a per-slot atom-existence logit. Each per-track decoder then
+maps slots to its reconstruction target — atom-level heads read individual
+slots, pair-level heads read symmetric outer products (`hi ⊕ hj`), triple-
+level heads (bond angles) read three-way concatenations.
 
-The 3D decoder reconstructs **atom types, bond lengths, and bond angles** — not
-raw xyz coordinates. This is consistent with the encoder: since no orientation
-information enters the latent, there is nothing to decode back to absolute
-coordinates.
+The 3D decoder reconstructs **atom types, bond lengths, and bond angles** —
+not raw xyz coordinates. This is consistent with the encoder: no orientation
+information enters the latent, so there is nothing to decode back to
+absolute coordinates.
 
 ### Distillation model
 
@@ -299,21 +351,31 @@ SMILES CSV ──── utils/featurize.py ───── train_mol_struct_ae.p
                                           → runs/distill/best.pt   (stage 2)
 ```
 
-### Stage 1 — `mol_struct_ae` (5-track autoencoder)
+### Stage 1 — `mol_struct_ae` (Pairformer autoencoder)
 
-Train with reconstruction over all 5 tracks + KL + cross-track consistency.
+Train with reconstruction losses over all per-track decoder outputs (atom
+features, adjacency, bond features, atom types, bond lengths, bond angles,
+partial charges, pharmacophore flags, dihedrals as sin/cos) plus a small
+KL regularizer on the latent.
 
 ```bash
 # Featurize once (CSV → sharded MolSample list[.pt])
+# max_atoms=96 is the recommended default — covers >95% of drug-like molecules.
 python utils/featurize.py --csv data/zinc250k.csv --out data/shards \
-                            --max-atoms 64 --shard-size 1024 --workers 8
+                            --max-atoms 96 --shard-size 1024 --workers 8
 
 # Train (resume-safe via --resume <ckpt>)
+# batch_size=24 fits comfortably at max_atoms=96 with AMP on a 24-GB GPU; the
+# triangle-attention scores tensor [B, N, N, N, H] is the memory ceiling.
 python train_mol_struct_ae.py --shard-dir data/shards \
                                 --out-dir runs/zinc250k \
-                                --epochs 20 --batch-size 64 --max-atoms 48 \
-                                --hidden 96 --latent 256 --lr 3e-4 --amp
+                                --epochs 3 --batch-size 24 --max-atoms 96 \
+                                --hidden 128 --latent 256 --lr 3e-4 --amp
 ```
+
+`--hidden` controls `d_single` (per-atom hidden width). `d_pair` (32) and
+`num_pairformer_blocks` (4) are `MolAEConfig` defaults set in code rather
+than via CLI.
 
 [train_mol_struct_ae.py](train_mol_struct_ae.py) reads sharded `MolSample`s
 via [`ShardedMolDataset`](mol_struct_ae/dataset.py), dense-collates each batch,
@@ -465,7 +527,7 @@ python scripts/simsearch.py \
 
 ### Embedding with `mol_struct_ae` directly (advanced)
 
-The 5-track autoencoder can be invoked for inference too — useful for
+The Pairformer autoencoder can be invoked for inference too — useful for
 debugging, for the precompute step in stage 2, or if you want the
 reconstruction outputs alongside the embedding. ~100 ms/mol because of RDKit.
 
@@ -496,10 +558,10 @@ L2-normalized, so cosine similarity falls out as a dot product. Self-similarity
 is 1.0; pair similarities live in roughly [−1, 1].
 
 For >1M molecules: embed once with the distillation model, stack into `[L, d]`,
-and hand to FAISS (`IndexFlatIP` up to ~1M, `IndexIVFPQ` beyond). The 5-track
-decoders are never needed at inference — they exist so the encoder learns a
-representation that *can* reconstruct each track, acting as a strong inductive
-prior against latent collapse.
+and hand to FAISS (`IndexFlatIP` up to ~1M, `IndexIVFPQ` beyond). The
+reconstruction decoders are never needed at inference — they exist so the
+Pairformer learns a representation that *can* reconstruct every input track,
+acting as a strong inductive prior against latent collapse.
 
 ---
 
@@ -511,13 +573,13 @@ mol_struct_ae/                            ← repo root
 ├── data/zinc250k.csv
 ├── runs/                                  ← runtime outputs (ckpts, vocab, results)
 │
-├── mol_struct_ae/                         ← MOL_STRUCT_AE package (5-track autoencoder)
+├── mol_struct_ae/                         ← MOL_STRUCT_AE package (pairformer autoencoder)
 │   ├── __init__.py
 │   ├── data.py            ← MolSample (carries .smiles), MolBatch, collate
 │   ├── dataset.py         ← ShardedMolDataset + ShardSequentialSampler + index cache
-│   ├── encoders.py        ← Graph2DEncoder, Geometry3DEncoder, ChargeEncoder,
-│   │                        PharmaEncoder, TorsionEncoder, DenseGATLayer, GaussianRBF
-│   ├── cross_attention.py ← PerAtomCrossAttention, TrackTokenFusion
+│   ├── pairformer.py      ← InputEmbedder, OuterProductMean, TriangleAttention,
+│   │                        SingleAttentionWithPairBias, PairformerBlock × N,
+│   │                        GlobalAggregator (the full encoder backbone)
 │   ├── decoders.py        ← AtomQueryDecoder + per-track decoders
 │   ├── model.py           ← MolStructAutoencoder, MolAEConfig
 │   └── losses.py          ← compute_total_loss, LossWeights, NT-Xent,
@@ -545,7 +607,7 @@ mol_struct_ae/                            ← repo root
 │   │                                             (SMILES, embed) pairs for distillation
 │   └── simsearch.py                            ← distillation cosine vs. Tanimoto top-K
 │
-├── train_mol_struct_ae.py                ← train the 5-track autoencoder
+├── train_mol_struct_ae.py                ← train the Pairformer autoencoder
 ├── train_distillation.py                 ← train the distillation model on pre-computed
 │                                           mol_struct_ae embeddings
 │
@@ -563,12 +625,12 @@ mol_struct_ae/                            ← repo root
 ```bash
 # 1. Featurize once (CPU, parallel)
 python utils/featurize.py --csv data/zinc250k.csv --out data/shards \
-                            --max-atoms 64 --workers 8
+                            --max-atoms 96 --workers 8
 
 # 2. Train mol_struct_ae (resume-safe via --resume)
 python train_mol_struct_ae.py --shard-dir data/shards --out-dir runs/zinc250k \
-                                --epochs 20 --batch-size 64 --max-atoms 48 \
-                                --hidden 96 --latent 256 --lr 3e-4 --amp
+                                --epochs 3 --batch-size 24 --max-atoms 96 \
+                                --hidden 128 --latent 256 --lr 3e-4 --amp
 ```
 
 **Distill mol_struct_ae → SMILES-only model locally:**
@@ -677,8 +739,5 @@ same featurization-and-leakage-filter pipeline. They use
 on GPU.
 
 Requirements: `torch >= 2.0`, `rdkit >= 2023.3.1`. No PyG dependency — the
-GATConv is implemented in dense form
-([encoders.py:`DenseGATLayer`](mol_struct_ae/encoders.py)) so the whole pipeline
-runs on batched tensors with `atom_mask`. If you'd rather use PyG's sparse
-`GATConv` for very large molecules, swap `Graph2DEncoder` — the rest of the
-pipeline is decoupled.
+whole pipeline runs on dense batched tensors with `atom_mask`, with the
+triangle attention in `pair_repr` handling all graph-structured updates.

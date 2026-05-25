@@ -1,9 +1,9 @@
 """
-Train MolStructAutoencoder on precomputed ZINC250k shards.
+Train the Pairformer MolStructAutoencoder on precomputed shards.
 
-Reconstruction + KL + cross-track consistency only. No contrastive head — the
-contrastive term is multiplied by zero by setting `LossWeights.contrastive=0`
-and never populating `pair_indices`.
+Reconstruction losses (10 per-track) + KL regularizer. No contrastive head,
+no cross-track-consistency module — both removed as part of the move to the
+unified Pairformer backbone.
 
 Run locally (for testing):
     python train_mol_struct_ae.py --shard-dir data/shards --epochs 1 --batch-size 16
@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 
 from mol_struct_ae import MolStructAutoencoder, compute_total_loss
 from mol_struct_ae.dataset import ShardedMolDataset, ShardSequentialSampler, make_collate_fn
-from mol_struct_ae.losses import CrossTrackConsistency, LossWeights
+from mol_struct_ae.losses import LossWeights
 from mol_struct_ae.model import MolAEConfig
 
 
@@ -78,14 +78,9 @@ def main():
     cfg = MolAEConfig(max_atoms=args.max_atoms, hidden_dim=args.hidden,
                        latent_dim=args.latent)
     model = MolStructAutoencoder(cfg).to(args.device)
-    cross = CrossTrackConsistency(cfg.hidden_dim, num_tracks=5).to(args.device)
+    weights = LossWeights()
 
-    # Contrastive is disabled — set its weight to zero so the no-op zero tensor
-    # is still well-defined for the autograd graph.
-    weights = LossWeights(contrastive=0.0)
-
-    opt = torch.optim.AdamW(list(model.parameters()) + list(cross.parameters()),
-                              lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and args.device == "cuda")
 
     total_steps = args.epochs * len(loader)
@@ -96,7 +91,6 @@ def main():
     if args.resume and Path(args.resume).is_file():
         ckpt = torch.load(args.resume, map_location=args.device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        cross.load_state_dict(ckpt["cross"])
         opt.load_state_dict(ckpt["opt"])
         start_step = ckpt.get("step", 0)
         print(f"[train] resumed from step {start_step}")
@@ -118,7 +112,7 @@ def main():
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=args.amp and args.device == "cuda"):
                 out = model(batch, sample=True)
-                losses = compute_total_loss(out, batch, cross_consistency=cross, weights=weights)
+                losses = compute_total_loss(out, batch, weights=weights)
                 total = losses["total"]
 
             scaler.scale(total).backward()
@@ -132,9 +126,10 @@ def main():
                 rate = (step - start_step + 1) / max(time.time() - t0, 1e-6)
                 msg = (f"[step {step:>6d} ep {epoch}] total={terms['total']:.4f} "
                         f"recon[2d={terms['atom_feat']:.3f}/adj={terms['adj']:.3f}/"
+                        f"len={terms['bond_len']:.3f}/ang={terms['bond_ang']:.3f}/"
                         f"chg={terms['partial_charges']:.4f}/"
                         f"tor={terms['torsion']:.3f}/pharma={terms['pharma']:.3f}] "
-                        f"kl={terms['kl']:.3f} cross={terms['cross_track']:.3f} "
+                        f"kl={terms['kl']:.3f} "
                         f"lr={lr:.2e} rate={rate:.1f}it/s")
                 print(msg, flush=True)
                 log_f.write(json.dumps({"step": step, "epoch": epoch, "lr": lr, **terms}) + "\n")
@@ -142,7 +137,7 @@ def main():
 
             if step > 0 and step % args.ckpt_every == 0:
                 ckpt_path = out_dir / f"ckpt_step{step:06d}.pt"
-                torch.save({"model": model.state_dict(), "cross": cross.state_dict(),
+                torch.save({"model": model.state_dict(),
                               "opt": opt.state_dict(), "step": step, "config": vars(args)},
                             ckpt_path)
                 print(f"[ckpt] saved {ckpt_path}", flush=True)
@@ -151,13 +146,13 @@ def main():
 
         # End-of-epoch checkpoint
         ckpt_path = out_dir / f"ckpt_epoch{epoch:03d}.pt"
-        torch.save({"model": model.state_dict(), "cross": cross.state_dict(),
+        torch.save({"model": model.state_dict(),
                       "opt": opt.state_dict(), "step": step, "config": vars(args)},
                     ckpt_path)
         print(f"[epoch {epoch}] saved {ckpt_path}", flush=True)
 
     final = out_dir / "final.pt"
-    torch.save({"model": model.state_dict(), "cross": cross.state_dict(),
+    torch.save({"model": model.state_dict(),
                   "opt": opt.state_dict(), "step": step, "config": vars(args)}, final)
     print(f"[done] saved {final}")
     log_f.close()

@@ -29,7 +29,7 @@ A `MolBatch` is the batched, dense form fed to the model:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import torch
 
@@ -84,8 +84,6 @@ class MolBatch:
     dihedral_mask: torch.Tensor       # [B, T]  bool
     atom_mask: torch.Tensor           # [B, N]  bool
     num_atoms: torch.Tensor           # [B]
-    pair_indices: Optional[torch.Tensor] = None  # [P, 2] indices into batch for contrastive pairs
-    pair_labels: Optional[torch.Tensor] = None   # [P]  1 = similar, 0 = dissimilar
 
     def to(self, device) -> "MolBatch":
         return MolBatch(

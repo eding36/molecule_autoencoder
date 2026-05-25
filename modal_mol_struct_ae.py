@@ -1075,21 +1075,29 @@ def zinc15_train(
     max_atoms: int = 48,
     lr: float = 3e-4,
     resume: str = "",
+    shard_dir: str = "",
+    out_dir: str = "",
 ):
     """Stage 3 / 3 — train mol_struct_ae on the 10M shards. ~17h for 1 epoch on A10G.
 
     If `resume` is given (path to a .pt checkpoint on the Modal volume),
     training continues from that checkpoint's model + optimizer state.
+
+    `shard_dir` / `out_dir` default to the ZINC15 5M paths but can be
+    overridden when training on a re-featurized shard set (e.g. max_atoms=96).
     """
-    print(f"[zinc15_train] epochs={epochs} hidden={hidden}/{latent} batch={batch_size} lr={lr}")
-    print(f"  shards = {ZINC15_SHARD_DIR}")
-    print(f"  output → {ZINC15_CKPT_DIR}")
+    sd = shard_dir or ZINC15_SHARD_DIR
+    od = out_dir or ZINC15_CKPT_DIR
+    print(f"[zinc15_train] epochs={epochs} hidden={hidden}/{latent} batch={batch_size} "
+           f"max_atoms={max_atoms} lr={lr}")
+    print(f"  shards = {sd}")
+    print(f"  output → {od}")
     if resume:
         print(f"  resume = {resume}")
     train_mol_struct_ae_modal.spawn(
         epochs=epochs, batch_size=batch_size, hidden=hidden, latent=latent,
         max_atoms=max_atoms, lr=lr, resume=resume,
-        shard_dir=ZINC15_SHARD_DIR, out_dir=ZINC15_CKPT_DIR,
+        shard_dir=sd, out_dir=od,
     )
 
 

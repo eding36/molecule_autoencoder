@@ -1,15 +1,23 @@
 """
-Top-level multi-track structural autoencoder.
+Top-level multi-track structural autoencoder, pairformer-based.
 
 Forward pass:
-    1. Each track's encoder produces per-atom features (where applicable) and a
-       global track token.
-    2. Per-atom cross-attention mixes the three atom-aligned tracks
-       (2D, 3D, pharma).
-    3. Track-token transformer fuses all four tracks into a latent z (mu/logvar
-       for light VAE regularization).
-    4. Each track's decoder reconstructs the original inputs from z + the fused
-       track tokens.
+    1. InputEmbedder maps all multi-track inputs (atom features, atom types,
+       partial charges, pharma flags, torsions, adjacency, bond features,
+       bond lengths) into two unified representations:
+           single_repr  [B, N, d_single]   per-atom
+           pair_repr    [B, N, N, d_pair]  per-(atom, atom)
+    2. PairformerStack runs N blocks; at every block, single and pair update
+       jointly via OuterProductMean (single→pair), TriangleAttention (pair
+       self-update), and AttentionWithPairBias (single←pair). Bond-angle /
+       through-space geometric info propagates through the pair tensor at
+       every layer instead of being collected in a separate cross-attention
+       stage at the end.
+    3. GlobalAggregator pools single_repr to produce a global latent z (with
+       μ/log σ² for light VAE regularization) plus 5 context tokens for the
+       decoders.
+    4. Each track's decoder reconstructs the original inputs from z + the
+       context tokens.
 
 The model returns a dict of predictions; losses are computed in losses.py.
 """
@@ -23,9 +31,7 @@ import torch.nn as nn
 
 from .data import (ATOM_FEAT_DIM, ATYPE_DIM, BOND_FEAT_DIM, MolBatch,
                     PHARMA_FEAT_DIM)
-from .encoders import (ChargeEncoder, Geometry3DEncoder, Graph2DEncoder,
-                        PharmaEncoder, TorsionEncoder)
-from .cross_attention import PerAtomCrossAttention, TrackTokenFusion
+from .pairformer import (InputEmbedder, PairformerStack, GlobalAggregator)
 from .decoders import (AtomQueryDecoder, ChargeDecoder, Geometry3DDecoder,
                         Graph2DDecoder, PharmaDecoder, TorsionDecoder)
 
@@ -33,14 +39,15 @@ from .decoders import (AtomQueryDecoder, ChargeDecoder, Geometry3DDecoder,
 @dataclass
 class MolAEConfig:
     max_atoms: int = 64
-    hidden_dim: int = 128
+    # Pairformer (single + pair representation) sizing
+    hidden_dim: int = 128          # d_single
+    pair_dim: int = 32             # d_pair
     latent_dim: int = 256
     heads: int = 4
-    gat_layers: int = 4
-    geom_layers: int = 4
-    pharma_layers: int = 2
-    cross_layers: int = 2
-    fusion_layers: int = 2
+    num_pairformer_blocks: int = 4
+    # Decoder context tokens (replaces the old 5 track tokens for compatibility)
+    num_context_tokens: int = 5
+    # Input feature dims (override if you change featurization)
     atom_feat_dim: int = ATOM_FEAT_DIM
     bond_feat_dim: int = BOND_FEAT_DIM
     atom_type_dim: int = ATYPE_DIM
@@ -52,32 +59,37 @@ class MolStructAutoencoder(nn.Module):
         super().__init__()
         cfg = cfg or MolAEConfig()
         self.cfg = cfg
-        d = cfg.hidden_dim
+        d_single = cfg.hidden_dim
+        d_pair = cfg.pair_dim
 
-        # Encoders
-        self.enc_2d = Graph2DEncoder(cfg.atom_feat_dim, cfg.bond_feat_dim, d, cfg.heads, cfg.gat_layers)
-        self.enc_3d = Geometry3DEncoder(cfg.atom_type_dim, d, cfg.geom_layers)
-        self.enc_charge = ChargeEncoder(d)
-        self.enc_pharma = PharmaEncoder(cfg.pharma_feat_dim, d, cfg.pharma_layers, cfg.heads)
-        self.enc_torsion = TorsionEncoder(cfg.atom_type_dim, d)
+        # ── Pairformer encoder stack ────────────────────────────────────────
+        self.input_embedder = InputEmbedder(
+            atom_feat_dim=cfg.atom_feat_dim,
+            atom_type_dim=cfg.atom_type_dim,
+            pharma_feat_dim=cfg.pharma_feat_dim,
+            bond_feat_dim=cfg.bond_feat_dim,
+            d_single=d_single, d_pair=d_pair,
+        )
+        self.pairformer = PairformerStack(
+            d_single=d_single, d_pair=d_pair,
+            num_blocks=cfg.num_pairformer_blocks,
+            heads_single=cfg.heads, heads_pair=cfg.heads,
+        )
+        self.aggregator = GlobalAggregator(
+            d_single=d_single, latent_dim=cfg.latent_dim,
+            num_context_tokens=cfg.num_context_tokens, heads=cfg.heads,
+        )
 
-        # Cross-attention (per-atom, across four atom-aligned tracks: 2D, 3D, pharma, torsion).
-        self.cross_atom = nn.ModuleList([
-            PerAtomCrossAttention(d, num_tracks=4, heads=cfg.heads)
-            for _ in range(cfg.cross_layers)
-        ])
-
-        # Track-token fusion → latent. 5 tracks: 2D, 3D, charge, pharma, torsion.
-        self.fusion = TrackTokenFusion(d, num_tracks=5, heads=cfg.heads,
-                                        num_layers=cfg.fusion_layers, latent_dim=cfg.latent_dim)
-
-        # Decoders share a single atom-query decoder that maps z + fused tokens → atom slots.
-        self.slot_decoder = AtomQueryDecoder(cfg.latent_dim, d, cfg.max_atoms, num_layers=2, heads=cfg.heads)
-        self.dec_2d = Graph2DDecoder(d, cfg.atom_feat_dim, cfg.bond_feat_dim)
-        self.dec_3d = Geometry3DDecoder(d, cfg.atom_type_dim, cfg.max_atoms)
-        self.dec_charge = ChargeDecoder(d)
-        self.dec_pharma = PharmaDecoder(d, cfg.pharma_feat_dim)
-        self.dec_torsion = TorsionDecoder(d)
+        # ── Decoders (unchanged API: consume z + list of context tokens) ────
+        self.slot_decoder = AtomQueryDecoder(
+            cfg.latent_dim, d_single, cfg.max_atoms,
+            num_layers=2, heads=cfg.heads,
+        )
+        self.dec_2d = Graph2DDecoder(d_single, cfg.atom_feat_dim, cfg.bond_feat_dim)
+        self.dec_3d = Geometry3DDecoder(d_single, cfg.atom_type_dim, cfg.max_atoms)
+        self.dec_charge = ChargeDecoder(d_single)
+        self.dec_pharma = PharmaDecoder(d_single, cfg.pharma_feat_dim)
+        self.dec_torsion = TorsionDecoder(d_single)
 
         # Similarity head (Tanimoto-like projection over the latent for contrastive loss)
         self.sim_proj = nn.Sequential(
@@ -86,46 +98,26 @@ class MolStructAutoencoder(nn.Module):
         )
 
     def encode(self, batch: MolBatch, sample: bool = False) -> Dict[str, torch.Tensor]:
-        # Per-track encoders
-        h2d, t2d = self.enc_2d(batch.atom_feats_2d, batch.bond_feats_2d,
-                                batch.adj_2d, batch.atom_mask)
-        h3d, t3d = self.enc_3d(batch.atom_types, batch.adj_2d,
-                                batch.bond_lengths, batch.bond_angles, batch.angle_mask,
-                                batch.atom_mask)
-        hch, tch = self.enc_charge(batch.partial_charges, batch.atom_mask)
-        hph, tph = self.enc_pharma(batch.pharma_feats, batch.atom_mask)
-        htor, ttor, _ = self.enc_torsion(batch.atom_types, batch.dihedral_index,
-                                          batch.dihedral_angles, batch.dihedral_mask,
-                                          batch.atom_mask)
+        # 1) input embedding: all tracks → (single, pair)
+        single, pair = self.input_embedder(batch)
 
-        # Per-atom cross-attention across (2D, 3D, Pharma, Torsion).
-        # Charge is voxel-shaped and joins only at the global-token stage.
-        atom_tracks = [h2d, h3d, hph, htor]
-        for layer in self.cross_atom:
-            atom_tracks = layer(atom_tracks, batch.atom_mask)
-        h2d, h3d, hph, htor = atom_tracks
+        # 2) pairformer stack: N blocks of (outer-product, triangle-attn,
+        #    pair-MLP, single-attn-with-pair-bias, single-MLP)
+        single, pair = self.pairformer(single, pair, batch.atom_mask)
 
-        # Refresh pooled tokens after per-atom mixing
-        mask_f = batch.atom_mask.unsqueeze(-1).float()
-        denom = mask_f.sum(dim=1).clamp(min=1.0)
-        t2d = (h2d * mask_f).sum(dim=1) / denom
-        t3d = (h3d * mask_f).sum(dim=1) / denom
-        tph = (hph * mask_f).sum(dim=1) / denom
-        ttor = (htor * mask_f).sum(dim=1) / denom
-
-        # Track-token transformer + latent head (5 tracks: 2D, 3D, charge, pharma, torsion)
-        fused_tokens, z_det, mu, logvar = self.fusion([t2d, t3d, tch, tph, ttor])
+        # 3) global pool → latent + context tokens for decoders
+        fused_tokens, mu, logvar = self.aggregator(single, batch.atom_mask)
 
         if sample and self.training:
             std = (0.5 * logvar).exp()
             z = mu + std * torch.randn_like(std)
         else:
-            z = z_det
+            z = mu
 
         return {
             "z": z, "mu": mu, "logvar": logvar,
             "fused_tokens": fused_tokens,
-            "h2d": h2d, "h3d": h3d, "hch": hch, "hph": hph, "htor": htor,
+            "single": single, "pair": pair,
         }
 
     def decode(self, z: torch.Tensor, fused_tokens, dihedral_index: torch.Tensor,
