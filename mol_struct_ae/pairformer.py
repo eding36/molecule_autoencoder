@@ -36,7 +36,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoders import GaussianRBF, masked_mean
+# ──────────────────────────────────────────────────────────────────────────────
+# Small helpers — inlined here because they're the only shared bits the
+# Pairformer needs.
+# ──────────────────────────────────────────────────────────────────────────────
+def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """x: [B, N, d], mask: [B, N] bool → [B, d] (masked-mean over N)."""
+    m = mask.unsqueeze(-1).float()
+    return (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+
+
+class GaussianRBF(nn.Module):
+    """Smear scalar values (distances/angles) into a fixed RBF basis."""
+
+    def __init__(self, num_centers: int = 32, low: float = 0.0, high: float = 5.0):
+        super().__init__()
+        centers = torch.linspace(low, high, num_centers)
+        self.register_buffer("centers", centers)
+        self.gamma = 1.0 / (centers[1] - centers[0]).item() ** 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        diff = x.unsqueeze(-1) - self.centers
+        return torch.exp(-self.gamma * diff.pow(2))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,9 +122,8 @@ class InputEmbedder(nn.Module):
         atom_mask_f = batch.atom_mask.unsqueeze(-1).float()                  # [B, N, 1]
 
         # ── single_repr from all per-atom tracks ─────────────────────────────
-        # NOTE: torsions no longer go through TorsionEncoder + per-atom scatter;
-        # they are placed in pair_repr at pair[i, l] below where they belong
-        # geometrically (the terminal atoms of the 4-atom chain).
+        # Dihedrals do NOT contribute here — they're 4-atom features that live
+        # in pair_repr at pair[i, l] (the terminal atoms of the 4-atom chain).
         h = self.atom_feat_emb(batch.atom_feats_2d)
         h = h + self.atom_type_emb(batch.atom_types)
         h = h + self.charge_emb(batch.partial_charges.unsqueeze(-1))

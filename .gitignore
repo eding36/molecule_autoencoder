@@ -1,1 +1,16 @@
 *.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Training / data outputs (large, regenerable)
+runs/
+data/shards*/
+*.pt
+
+# Editor / OS
+.DS_Store
+.venv/
+.vscode/
