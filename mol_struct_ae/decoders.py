@@ -141,29 +141,58 @@ class ChargeDecoder(nn.Module):
 
 
 class TorsionDecoder(nn.Module):
-    """Predicts (sin φ, cos φ) for each padded dihedral slot.
+    """Predicts each dihedral as a 36-class distribution over 10° bins.
 
-    Inputs: atom slot features and the dihedral atom indices (same indexing the
-    model is asked to reconstruct). We gather the 4 slot vectors per torsion and
-    regress to a 2D unit vector.
+    Two important design changes vs the original:
+
+    1. **Direct pair_repr read (Fix A):** in addition to the 4 atom slot
+       features, we gather `pair[i, l]` and `pair[j, k]` from post-Pairformer
+       pair_repr. The dihedral was scattered into those pair entries at the
+       input embedder, so the relevant signal is sitting right there — no
+       need to make it round-trip through z and back through slot_decoder.
+
+    2. **36-bin classification (Fix D):** instead of regressing (sin φ, cos φ),
+       we output 36 logits per dihedral (10° bins covering [-π, π]). This is
+       robust to ETKDG's ~10–20° conformer noise (small angle differences
+       land in the same bin) and naturally captures multimodal targets
+       (a rotatable bond can have gauche+, trans, gauche- minima).
+
+    Output shape: [B, T, n_bins].
     """
 
-    def __init__(self, hidden_dim: int):
+    def __init__(self, d_single: int, d_pair: int, n_bins: int = 36):
         super().__init__()
+        self.n_bins = n_bins
+        in_dim = 4 * d_single + 2 * d_pair
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(in_dim, d_single * 2), nn.GELU(),
+            nn.Linear(d_single * 2, d_single), nn.GELU(),
+            nn.Linear(d_single, n_bins),
         )
 
-    def forward(self, slot_h: torch.Tensor, dihedral_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        slot_h: torch.Tensor,                  # [B, N, d_single]
+        pair: torch.Tensor,                    # [B, N, N, d_pair]
+        dihedral_index: torch.Tensor,          # [B, T, 4]
+    ) -> torch.Tensor:
         B, N, D = slot_h.shape
         T = dihedral_index.shape[1]
         idx = dihedral_index.clamp(min=0, max=N - 1)                            # [B,T,4]
+        # Gather slot features at i, j, k, l
         b_idx = torch.arange(B, device=slot_h.device).view(B, 1, 1).expand_as(idx)
         gathered = slot_h[b_idx, idx]                                           # [B,T,4,D]
-        flat = gathered.view(B, T, -1)
-        out = self.mlp(flat)                                                    # [B,T,2] = (sin, cos)
-        return out
+        flat = gathered.view(B, T, -1)                                          # [B,T,4*D]
+        # Gather pair entries at (i, l) and (j, k) where the dihedral was scattered
+        b1 = torch.arange(B, device=slot_h.device).view(B, 1).expand(B, T)
+        i_idx = idx[..., 0]
+        j_idx = idx[..., 1]
+        k_idx = idx[..., 2]
+        l_idx = idx[..., 3]
+        p_il = pair[b1, i_idx, l_idx]                                           # [B,T,d_pair]
+        p_jk = pair[b1, j_idx, k_idx]                                           # [B,T,d_pair]
+        x = torch.cat([flat, p_il, p_jk], dim=-1)                                # [B,T,4*D+2*d_pair]
+        return self.mlp(x)                                                       # [B,T,n_bins]
 
 
 class PharmaDecoder(nn.Module):

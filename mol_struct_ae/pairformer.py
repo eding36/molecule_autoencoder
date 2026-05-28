@@ -111,10 +111,12 @@ class InputEmbedder(nn.Module):
         self.angle_rbf = GaussianRBF(num_rbf, 0.0, _math.pi)
         self.angle_emb = nn.Linear(num_rbf, d_pair)
 
-        # 4-bond signal: signed dihedrals via sin/cos RBFs (i-j-k-l → pair[i,l])
+        # 4-bond signal: signed dihedrals via multi-frequency Fourier RBFs.
+        # Three harmonics (1ω, 2ω, 3ω) natively encode the 3-fold symmetry
+        # of σ-bond rotation landscapes (gauche+, trans, gauche- minima).
         self.dih_cos_rbf = GaussianRBF(num_rbf, -1.0, 1.0)
         self.dih_sin_rbf = GaussianRBF(num_rbf, -1.0, 1.0)
-        self.dih_emb = nn.Linear(num_rbf * 2, d_pair)
+        self.dih_emb = nn.Linear(num_rbf * 6, d_pair)   # 3 freqs × (cos, sin)
 
         self.pair_norm = nn.LayerNorm(d_pair)
 
@@ -151,21 +153,31 @@ class InputEmbedder(nn.Module):
             pair = pair.index_put((b_a, i_a, k_a), ang_feats, accumulate=True)
             pair = pair.index_put((b_a, k_a, i_a), ang_feats, accumulate=True)
 
-        # ── pair_repr: 4-bond signal from dihedrals (i-j-k-l → pair[i,l]) ────
+        # ── pair_repr: dihedrals scattered into BOTH terminal and axis pairs ─
+        # For each dihedral (i, j, k, l):
+        #   pair[i, l] / pair[l, i]  — the 4-bond terminal pair
+        #   pair[j, k] / pair[k, j]  — the rotation-axis pair
+        # Giving the model two complementary entry points for the same signal.
         if batch.dihedral_mask.any():
             valid = batch.dihedral_mask.nonzero(as_tuple=False)              # [P, 2]: (b, t)
             b_d, t_d = valid.unbind(dim=-1)
             quads = batch.dihedral_index[b_d, t_d]                            # [P, 4]
-            i_d = quads[:, 0]
-            l_d = quads[:, 3]
+            i_d, j_d, k_d, l_d = quads.unbind(dim=-1)
             phi = batch.dihedral_angles[b_d, t_d]                             # [P]
+            # Multi-frequency Fourier features: 1ω, 2ω, 3ω each as (cos, sin)
+            # → 6 RBF blocks. Captures 3-fold rotational symmetry natively.
             dih_in = torch.cat([
-                self.dih_cos_rbf(phi.cos()),
-                self.dih_sin_rbf(phi.sin()),
-            ], dim=-1)                                                        # [P, num_rbf*2]
+                self.dih_cos_rbf(phi.cos()),         self.dih_sin_rbf(phi.sin()),
+                self.dih_cos_rbf((2 * phi).cos()),   self.dih_sin_rbf((2 * phi).sin()),
+                self.dih_cos_rbf((3 * phi).cos()),   self.dih_sin_rbf((3 * phi).sin()),
+            ], dim=-1)                                                        # [P, num_rbf*6]
             dih_feats = self.dih_emb(dih_in)                                  # [P, d_pair]
+            # Terminal-pair scatter
             pair = pair.index_put((b_d, i_d, l_d), dih_feats, accumulate=True)
             pair = pair.index_put((b_d, l_d, i_d), dih_feats, accumulate=True)
+            # Axis-pair scatter (the j-k bond around which the rotation happens)
+            pair = pair.index_put((b_d, j_d, k_d), dih_feats, accumulate=True)
+            pair = pair.index_put((b_d, k_d, j_d), dih_feats, accumulate=True)
 
         # ── normalise + mask padded atom rows/columns ────────────────────────
         pair_mask = (
@@ -423,10 +435,21 @@ class PairformerStack(nn.Module):
 # Aggregator: single_repr → (z, fused_tokens for decoders)
 # ──────────────────────────────────────────────────────────────────────────────
 class GlobalAggregator(nn.Module):
-    """Pool single_repr to produce:
-      • a global CLS-like vector → μ, log σ² → z (latent)
+    """Pool single_repr via learned-query attention to produce:
+      • A CLS-like vector → μ, log σ²  → z (the latent)
       • K context tokens that the decoders consume as cross-attention memory
-        (replaces the old 5-track-token list — keeps the decoder API stable)
+
+    Implementation note: K + 1 learned queries share one MultiheadAttention.
+    Query index 0 is the CLS query (drives the latent); queries 1…K are the
+    context tokens (decoder memory). This matches the 5-track architecture's
+    pattern where the latent came from a CLS-token attending over the
+    pooled track tokens — the discrimination came from learned attention
+    weights, not arithmetic mean.
+
+    Previous design used arithmetic masked-mean over per-atom features for
+    the latent. That averaged out molecular distinctions: aspirin and
+    glucose (similar atom-feature distributions) ended up with similar
+    means → very high cosine similarity → poor downstream discrimination.
     """
 
     def __init__(
@@ -439,13 +462,14 @@ class GlobalAggregator(nn.Module):
         super().__init__()
         self.num_context = num_context_tokens
         self.norm = nn.LayerNorm(d_single)
-        self.cls_proj = nn.Sequential(nn.Linear(d_single, d_single), nn.GELU())
-        # K learned queries that attend over single_repr → K context tokens
-        self.context_queries = nn.Parameter(torch.randn(num_context_tokens, d_single) * 0.02)
-        self.context_attn = nn.MultiheadAttention(
+        # K + 1 learned queries: index 0 = CLS (drives latent), 1..K = context
+        self.queries = nn.Parameter(
+            torch.randn(num_context_tokens + 1, d_single) * 0.02
+        )
+        self.attn = nn.MultiheadAttention(
             d_single, num_heads=heads, batch_first=True,
         )
-        # Latent heads
+        # Latent heads (consume the CLS-attention output)
         self.mu_head = nn.Linear(d_single, latent_dim)
         self.logvar_head = nn.Linear(d_single, latent_dim)
 
@@ -453,16 +477,18 @@ class GlobalAggregator(nn.Module):
         self, single: torch.Tensor, atom_mask: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
         x = self.norm(single)
-        # CLS = masked mean of a projected single
-        cls = masked_mean(self.cls_proj(x), atom_mask)                       # [B, d]
-        mu = self.mu_head(cls)
-        logvar = self.logvar_head(cls)
-
-        # Context tokens via learned-query attention
         B = x.shape[0]
-        queries = self.context_queries.unsqueeze(0).expand(B, -1, -1)        # [B, K, d]
+        queries = self.queries.unsqueeze(0).expand(B, -1, -1)                  # [B, K+1, d]
         key_pad = ~atom_mask
-        ctx, _ = self.context_attn(queries, x, x, key_padding_mask=key_pad)   # [B, K, d]
+        out, _ = self.attn(queries, x, x, key_padding_mask=key_pad)            # [B, K+1, d]
+
+        # First query is CLS — drives the latent through learned attention
+        cls_out = out[:, 0, :]                                                  # [B, d]
+        mu = self.mu_head(cls_out)
+        logvar = self.logvar_head(cls_out)
+
+        # Remaining K queries are decoder context tokens
+        ctx = out[:, 1:, :]                                                     # [B, K, d]
         fused_tokens = [ctx[:, i, :] for i in range(self.num_context)]
 
         return fused_tokens, mu, logvar

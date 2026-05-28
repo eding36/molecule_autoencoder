@@ -89,9 +89,15 @@ class MolStructAutoencoder(nn.Module):
         self.dec_3d = Geometry3DDecoder(d_single, cfg.atom_type_dim, cfg.max_atoms)
         self.dec_charge = ChargeDecoder(d_single)
         self.dec_pharma = PharmaDecoder(d_single, cfg.pharma_feat_dim)
-        self.dec_torsion = TorsionDecoder(d_single)
+        self.dec_torsion = TorsionDecoder(d_single, cfg.pair_dim)
 
-        # Similarity head (Tanimoto-like projection over the latent for contrastive loss)
+        # NOTE: a `sim_proj` MLP used to wrap z into a separate similarity
+        # embedding (SimCLR-style projection head). We removed it because
+        # there's no contrastive loss to train it; it stayed at random init
+        # and just degraded similarity by adding noise. `sim_embed` is now
+        # `z` directly. The old `sim_proj.*` keys are kept in the state dict
+        # only as a dummy module so legacy checkpoints continue to load
+        # without strict=False; the module is never called.
         self.sim_proj = nn.Sequential(
             nn.Linear(cfg.latent_dim, cfg.latent_dim), nn.GELU(),
             nn.Linear(cfg.latent_dim, cfg.latent_dim),
@@ -120,8 +126,9 @@ class MolStructAutoencoder(nn.Module):
             "single": single, "pair": pair,
         }
 
-    def decode(self, z: torch.Tensor, fused_tokens, dihedral_index: torch.Tensor,
-                angle_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def decode(self, z: torch.Tensor, fused_tokens, pair: torch.Tensor,
+                dihedral_index: torch.Tensor, angle_mask: torch.Tensor,
+                ) -> Dict[str, torch.Tensor]:
         ctx = torch.stack(fused_tokens, dim=1)                              # [B, 5, hidden]
         slot_h, atom_mask_logits = self.slot_decoder(z, ctx)
 
@@ -129,7 +136,10 @@ class MolStructAutoencoder(nn.Module):
         atype, bond_len, bond_ang = self.dec_3d(slot_h, angle_mask)
         partial = self.dec_charge(slot_h)
         pharma_pred = self.dec_pharma(slot_h)
-        torsion_sincos = self.dec_torsion(slot_h, dihedral_index)
+        # TorsionDecoder now reads post-Pairformer pair_repr at the (i,l) and
+        # (j,k) entries for each dihedral, and outputs 36-bin classification
+        # logits instead of (sin, cos) regression.
+        torsion_logits = self.dec_torsion(slot_h, pair, dihedral_index)
 
         return {
             "atom_mask_logits": atom_mask_logits,
@@ -141,10 +151,12 @@ class MolStructAutoencoder(nn.Module):
             "bond_ang": bond_ang,
             "partial_charges": partial,
             "pharma_pred": pharma_pred,
-            "torsion_sincos": torsion_sincos,
+            "torsion_logits": torsion_logits,
         }
 
     def forward(self, batch: MolBatch, sample: bool = True) -> Dict[str, torch.Tensor]:
         enc = self.encode(batch, sample=sample)
-        dec = self.decode(enc["z"], enc["fused_tokens"], batch.dihedral_index, batch.angle_mask)
-        return {**enc, **dec, "sim_embed": self.sim_proj(enc["z"])}
+        dec = self.decode(enc["z"], enc["fused_tokens"], enc["pair"],
+                          batch.dihedral_index, batch.angle_mask)
+        # sim_embed aliases z directly — see note in __init__ about sim_proj.
+        return {**enc, **dec, "sim_embed": enc["z"]}

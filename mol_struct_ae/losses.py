@@ -18,6 +18,7 @@ Regularizer (1 term):
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -66,7 +67,10 @@ class LossWeights:
     pharma: float = 0.5
 
     # Regularizer
-    kl: float = 1e-3
+    # Bumped 1e-3 → 2e-3 to combat latent re-collapse. β=5e-3 fixed the worst
+    # collapse (aspirin/glucose 0.92→0.79) but over-spread small edits
+    # (benzene/toluene 0.88→0.64); 2e-3 is the targeted middle ground.
+    kl: float = 2e-3
 
 
 def compute_total_loss(out: Dict[str, torch.Tensor], batch: MolBatch,
@@ -104,11 +108,27 @@ def compute_total_loss(out: Dict[str, torch.Tensor], batch: MolBatch,
     # --- Pharma track ---
     losses["pharma"] = masked_bce(out["pharma_pred"], batch.pharma_feats, atom_mask)
 
-    # --- Torsion track --- regress sin/cos to respect angular topology.
-    sincos_pred = out["torsion_sincos"]                                        # [B, T, 2]
-    target_sincos = torch.stack([batch.dihedral_angles.sin(),
-                                  batch.dihedral_angles.cos()], dim=-1)        # [B, T, 2]
-    losses["torsion"] = masked_mse(sincos_pred, target_sincos, batch.dihedral_mask)
+    # --- Torsion track --- 36-bin classification over [-π, π].
+    # The TorsionDecoder outputs n_bins logits per dihedral. We bin the
+    # target angles into 10°-wide buckets and use cross-entropy. This is
+    # robust to ETKDG's ~10–20° conformer noise (small angle differences
+    # land in the same bin) and naturally captures multimodal targets
+    # (a rotatable bond can have gauche+, trans, gauche- minima).
+    #
+    # Loss scale: random chance ≈ log(36) ≈ 3.58; correct-bin most of the
+    # time ≈ 0.5; near-perfect ≈ 0.1.
+    torsion_logits = out["torsion_logits"]                                     # [B, T, n_bins]
+    n_bins = torsion_logits.shape[-1]
+    # Bin index = floor((φ + π) / (2π / n_bins))
+    bin_idx = ((batch.dihedral_angles + math.pi) * n_bins
+               / (2.0 * math.pi)).long().clamp(0, n_bins - 1)                  # [B, T]
+    ce = F.cross_entropy(
+        torsion_logits.reshape(-1, n_bins),
+        bin_idx.reshape(-1),
+        reduction="none",
+    ).reshape(bin_idx.shape)                                                   # [B, T]
+    mask_f = batch.dihedral_mask.float()
+    losses["torsion"] = (ce * mask_f).sum() / mask_f.sum().clamp(min=1.0)
 
     # --- KL (β-VAE) ---
     mu, logvar = out["mu"], out["logvar"]
