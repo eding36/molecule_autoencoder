@@ -46,7 +46,6 @@ image = (
         "pandas>=2.0",
         "tqdm>=4.65",
         "scikit-learn>=1.3",
-        "PyTDC>=0.4.1",   # Therapeutics Data Commons — LIT-PCBA + other benchmarks
     )
     .add_local_dir(
         LOCAL_PROJECT,
@@ -186,11 +185,12 @@ def precompute(
     shard_size: int = 1024,
     workers: int = 16,
     limit: int = 0,
+    shard_dir: str = "",
 ):
     print(f"Featurizing ZINC250k on Modal — max_atoms={max_atoms} workers={workers}")
     precompute_features.spawn(
         max_atoms=max_atoms, shard_size=shard_size,
-        workers=workers, limit=limit,
+        workers=workers, limit=limit, shard_dir=shard_dir,
     )
 
 
@@ -427,248 +427,6 @@ def simsearch(
             break
 
 
-# ─── MoleculeACE benchmark (GPU, multi-CPU) ────────────────────────────────────
-@app.function(
-    image=image,
-    gpu="A10G",
-    cpu=16.0,
-    memory=32 * 1024,
-    timeout=60 * 60 * 4,
-    volumes={RUNS_DIR: runs_vol},
-)
-def moleculeace_benchmark_modal(checkpoint: str, targets: list,
-                                  workers: int = 12,
-                                  embed_batch_size: int = 256,
-                                  train_smiles_path: str = "") -> list:
-    import sys
-    sys.path.insert(0, REMOTE_DIR)
-    import torch
-    from mol_struct_ae import MolStructAutoencoder
-    from mol_struct_ae.model import MolAEConfig
-    from mol_struct_ae.dataset import make_collate_fn
-    from utils.moleculeace_benchmark import run_moleculeace
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    cfg_args = ckpt.get("config", {})
-    cfg = MolAEConfig(
-        max_atoms=cfg_args.get("max_atoms", 64),
-        hidden_dim=cfg_args.get("hidden", 96),
-        latent_dim=cfg_args.get("latent", 256),
-    )
-    model = MolStructAutoencoder(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    print(f"[moleculeace] loaded ckpt step={ckpt.get('step','?')}  workers={workers}")
-
-    collate_fn = make_collate_fn(cfg.max_atoms, cfg_args.get("max_dihedrals", 64))
-    return run_moleculeace(model, collate_fn, device, cfg.max_atoms,
-                             targets=targets or None, workers=workers,
-                             embed_batch_size=embed_batch_size,
-                             train_smiles_path=train_smiles_path or None)
-
-
-@app.local_entrypoint()
-def moleculeace_benchmark(checkpoint: str = "", targets: str = "",
-                           train_smiles_path: str = ""):
-    """MoleculeACE activity-cliff benchmark on a subset of ChEMBL targets.
-
-    Run a Ridge probe on (frozen embedding → pIC50). Compare RMSE on overall
-    test set vs RMSE on the 'cliff_mol' subset. A chemistry-aware embedding
-    has cliff RMSE ≈ overall RMSE; a Morgan-FP-like embedding has cliff RMSE
-    much higher than overall.
-    """
-    ckpt = checkpoint or f"{ZINC15_CKPT_DIR}/final.pt"
-    train_smis = train_smiles_path or f"{RUNS_DIR}/train_smiles_zinc15_5m.json.gz"
-    tgt_list = [t.strip() for t in targets.split(",") if t.strip()] if targets else []
-    print(f"[moleculeace_benchmark] ckpt={ckpt}")
-    print(f"  leakage set: {train_smis}")
-    print(f"  targets: {tgt_list or 'DEFAULT_SUBSET'}")
-    res = moleculeace_benchmark_modal.remote(checkpoint=ckpt, targets=tgt_list,
-                                                train_smiles_path=train_smis)
-
-    print("\n" + "=" * 118)
-    print("  MoleculeACE — Ridge probe on frozen embeddings, RMSE (lower=better) "
-           "[leakage-filtered against ZINC15 5M train]")
-    print("=" * 118)
-    print(f"  {'Target':<22}  {'leak':>4}  {'n_test':>6}  {'cliff':>5}  "
-           f"{'all (m / fp)':>16}  {'cliff (m / fp)':>16}  {'non-cliff (m / fp)':>20}  "
-           f"{'cliff gap (m / fp)':>20}")
-    print(f"  {'-'*22}  {'-'*4}  {'-'*6}  {'-'*5}  "
-           f"{'-'*16}  {'-'*16}  {'-'*20}  {'-'*20}")
-    for r in res:
-        if "error" in r:
-            print(f"  {r['target']:<22}  ERROR: {r['error']}")
-            continue
-        all_m = r['rmse_all_model']; all_fp = r['rmse_all_fp']
-        cl_m  = r['rmse_cliff_model']; cl_fp  = r['rmse_cliff_fp']
-        nc_m  = r['rmse_noncl_model']; nc_fp  = r['rmse_noncl_fp']
-        gap_m = cl_m - nc_m
-        gap_fp = cl_fp - nc_fp
-        leak = r.get('n_dropped_leak', 0)
-        print(f"  {r['target']:<22}  {leak:>4}  {r['n_test']:>6}  {r['n_test_cliff']:>5}  "
-               f"{all_m:>6.3f} / {all_fp:>6.3f}  "
-               f"{cl_m:>6.3f} / {cl_fp:>6.3f}  "
-               f"{nc_m:>8.3f} / {nc_fp:>8.3f}  "
-               f"{gap_m:>+8.3f} / {gap_fp:>+8.3f}")
-    print()
-    print("  Notes:")
-    print("    • Cliff RMSE = error on test mols flagged as activity-cliff pairs")
-    print("    • A chemistry-aware embedding should have small (cliff - non-cliff) gap")
-    print("    • Morgan-FP-only models typically have large positive gap on cliffs")
-
-
-# ─── LIT-PCBA benchmark (GPU, multi-CPU) ───────────────────────────────────────
-@app.function(
-    image=image,
-    gpu="A10G",
-    cpu=16.0,
-    memory=32 * 1024,
-    timeout=60 * 60 * 6,
-    volumes={RUNS_DIR: runs_vol},
-)
-def litpcba_benchmark_modal(checkpoint: str, targets: list, max_decoys: int = 10000,
-                              workers: int = 12, embed_batch_size: int = 256,
-                              train_smiles_path: str = "") -> list:
-    import sys
-    sys.path.insert(0, REMOTE_DIR)
-    import torch
-    from mol_struct_ae import MolStructAutoencoder
-    from mol_struct_ae.model import MolAEConfig
-    from mol_struct_ae.dataset import make_collate_fn
-    from utils.litpcba_benchmark import run_litpcba
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    cfg_args = ckpt.get("config", {})
-    cfg = MolAEConfig(
-        max_atoms=cfg_args.get("max_atoms", 64),
-        hidden_dim=cfg_args.get("hidden", 96),
-        latent_dim=cfg_args.get("latent", 256),
-    )
-    model = MolStructAutoencoder(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    print(f"[litpcba] loaded ckpt step={ckpt.get('step','?')}  workers={workers}")
-
-    collate_fn = make_collate_fn(cfg.max_atoms, cfg_args.get("max_dihedrals", 64))
-    return run_litpcba(model, collate_fn, device, cfg.max_atoms,
-                        targets=targets or None, max_decoys=max_decoys,
-                        workers=workers, embed_batch_size=embed_batch_size,
-                        train_smiles_path=train_smiles_path or None)
-
-
-@app.local_entrypoint()
-def litpcba_benchmark(checkpoint: str = "", targets: str = "",
-                       max_decoys: int = 10000,
-                       train_smiles_path: str = ""):
-    """LIT-PCBA virtual-screening benchmark on a subset of protein targets.
-
-    For each target: embed actives + sampled decoys; pick 5 actives as queries;
-    rank everything else by max cosine to a query. Report:
-        EF@1%, EF@5%   (enrichment factor — higher better; random = 1.0)
-        AUROC          (ranking-based)
-    """
-    ckpt = checkpoint or f"{ZINC15_CKPT_DIR}/final.pt"
-    train_smis = train_smiles_path or f"{RUNS_DIR}/train_smiles_zinc15_5m.json.gz"
-    tgt_list = [t.strip() for t in targets.split(",") if t.strip()] if targets else []
-    print(f"[litpcba_benchmark] ckpt={ckpt}  max_decoys={max_decoys}")
-    print(f"  leakage set: {train_smis}")
-    print(f"  targets: {tgt_list or 'DEFAULT_SUBSET'}")
-    res = litpcba_benchmark_modal.remote(checkpoint=ckpt, targets=tgt_list,
-                                            max_decoys=max_decoys,
-                                            train_smiles_path=train_smis)
-
-    print("\n" + "=" * 115)
-    print("  LIT-PCBA — virtual screening enrichment (higher = better; random = 1.0) "
-           "[leakage-filtered against ZINC15 5M train]")
-    print("=" * 115)
-    print(f"  {'Target':<12}  {'N_act':>6}  {'N_dec':>6}  {'leak (a/d)':>10}  "
-           f"{'EF@1% (m / fp)':>18}  {'EF@5% (m / fp)':>18}  {'AUROC (m / fp)':>18}")
-    print(f"  {'-'*12}  {'-'*6}  {'-'*6}  {'-'*10}  "
-           f"{'-'*18}  {'-'*18}  {'-'*18}")
-    for r in res:
-        if "error" in r:
-            print(f"  {r['target']:<12}  ERROR: {r['error']}")
-            continue
-        leak_str = f"{r.get('leak_actives',0)}/{r.get('leak_decoys',0)}"
-        print(f"  {r['target']:<12}  {r['n_actives']:>6}  {r['n_decoys']:>6}  {leak_str:>10}  "
-               f"{r['model_EF1']:>7.2f} / {r['fp_EF1']:>7.2f}  "
-               f"{r['model_EF5']:>7.2f} / {r['fp_EF5']:>7.2f}  "
-               f"{r['model_AUROC']:>7.3f} / {r['fp_AUROC']:>7.3f}")
-    print()
-    print("  Notes:")
-    print("    • (model / fp) → cosine on our embedding vs cosine on 1024-bit Morgan FPs")
-    print("    • Decoys subsampled to max_decoys per target (default 10K)")
-    print("    • Queries: 5 actives per draw, averaged over 10 random draws")
-
-
-# ─── Perturbation smoke test (GPU) ─────────────────────────────────────────────
-# Measure how the embedding moves under controlled structural perturbations:
-# +CH2 (methylene), +CH3 (methyl), halogen swap, +phenyl ring.
-@app.function(
-    image=image,
-    gpu="A10G",
-    timeout=60 * 30,
-    volumes={RUNS_DIR: runs_vol},
-)
-def pair_compare_modal(checkpoint: str, pairs: list) -> list:
-    """For each (label, smi_a, smi_b) tuple, embed both and return cosine sim.
-
-    `pairs` arrives as a JSON-serialisable list of [str, str, str] lists.
-    """
-    import sys
-    sys.path.insert(0, REMOTE_DIR)
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
-    from mol_struct_ae import MolStructAutoencoder
-    from mol_struct_ae.model import MolAEConfig
-    from mol_struct_ae.data import collate
-    from utils.featurize import featurize_smiles
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    cfg_args = ckpt.get("config", {})
-    cfg = MolAEConfig(
-        max_atoms=cfg_args.get("max_atoms", 64),
-        hidden_dim=cfg_args.get("hidden", 96),
-        latent_dim=cfg_args.get("latent", 256),
-    )
-    model = MolStructAutoencoder(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    print(f"[pair_compare] loaded ckpt step={ckpt.get('step','?')} on {device}")
-
-    # Featurize unique SMILES once
-    seen: dict = {}
-    for label, a, b in pairs:
-        for smi in (a, b):
-            if smi not in seen:
-                s = featurize_smiles(smi, max_atoms=cfg.max_atoms)
-                if s is None:
-                    print(f"[pair_compare] WARN failed to featurize {smi}")
-                seen[smi] = s
-
-    # Embed in one batch where possible
-    smi_list = [s for s, samp in seen.items() if samp is not None]
-    samples = [seen[s] for s in smi_list]
-    batch = collate(samples, max_atoms=cfg.max_atoms).to(device)
-    with torch.no_grad():
-        out = model(batch, sample=False)
-        E = F.normalize(out["sim_embed"], dim=-1).cpu().numpy()
-    emb = {s: E[i] for i, s in enumerate(smi_list)}
-
-    results = []
-    for label, a, b in pairs:
-        if a not in emb or b not in emb:
-            results.append({"label": label, "a": a, "b": b, "cosine": None})
-            continue
-        cos = float(np.dot(emb[a], emb[b]))
-        results.append({"label": label, "a": a, "b": b, "cosine": cos})
-    return results
-
-
 # ─── Training-set SMILES extractor (CPU) ───────────────────────────────────────
 # Iterates a shard directory, pulls the canonical SMILES out of every MolSample
 # (stripped of stereo info so the leakage check is conservative), dedupes, and
@@ -755,21 +513,21 @@ def extract_train_smiles(shard_dir: str = "", out_path: str = ""):
     extract_train_smiles_modal.spawn(shard_dir=sd, out_path=op)
 
 
-# ─── MoleculeNet benchmark (GPU) ───────────────────────────────────────────────
+# ─── MoleculeNet FINE-TUNING benchmark (GPU) ──────────────────────────────────
+# Replicates the Hu et al. (2020) / Mole-BERT (ICLR 2023) protocol: fine-tune
+# the pretrained encoder END-TO-END with a task head, scaffold 80/10/10, report
+# test ROC-AUC/RMSE at the best-validation epoch, mean±std over N seeds.
+# This is the apples-to-apples harness for comparing against Mole-BERT Table 1.
 @app.function(
     image=image,
     gpu="A10G",
-    timeout=60 * 60 * 2,
+    timeout=60 * 60 * 12,
     volumes={RUNS_DIR: runs_vol},
 )
-def moleculenet_benchmark_modal(checkpoint: str, datasets: list,
-                                  embed_batch_size: int = 128,
-                                  train_smiles_path: str = "") -> list:
-    """Run MoleculeNet linear-probe benchmark on the supplied datasets.
-
-    If `train_smiles_path` is non-empty, drop every benchmark molecule whose
-    canonical (stereo-stripped) SMILES is in that file.
-    """
+def moleculenet_finetune_modal(checkpoint: str, datasets: list, seeds: list,
+                                epochs: int = 100, batch_size: int = 32,
+                                lr: float = 1e-3, dropout: float = 0.5,
+                                train_smiles_path: str = "") -> list:
     import sys
     sys.path.insert(0, REMOTE_DIR)
     import torch
@@ -777,7 +535,7 @@ def moleculenet_benchmark_modal(checkpoint: str, datasets: list,
     from mol_struct_ae.model import MolAEConfig
     from mol_struct_ae.dataset import make_collate_fn
     from utils.featurize import featurize_smiles
-    from utils.moleculenet_benchmark import run_benchmark
+    from utils.benchmark_moleculenet import run_finetune_benchmark
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -787,164 +545,83 @@ def moleculenet_benchmark_modal(checkpoint: str, datasets: list,
         hidden_dim=cfg_args.get("hidden", 96),
         latent_dim=cfg_args.get("latent", 256),
     )
-    model = MolStructAutoencoder(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    print(f"[bench] loaded ckpt step={ckpt.get('step','?')} max_atoms={cfg.max_atoms}")
+    state = ckpt["model"]
+    print(f"[ft] loaded ckpt step={ckpt.get('step','?')} max_atoms={cfg.max_atoms} "
+           f"hidden={cfg.hidden_dim} latent={cfg.latent_dim}")
+
+    # Each seed needs a FRESH pretrained encoder (fine-tuning mutates weights).
+    def make_ae():
+        ae = MolStructAutoencoder(cfg)
+        ae.load_state_dict(state)
+        return ae
 
     collate_fn = make_collate_fn(cfg.max_atoms, cfg_args.get("max_dihedrals", 64))
-    results = run_benchmark(
-        featurize_fn=featurize_smiles,
-        model=model,
-        collate_fn=collate_fn,
-        device=device,
-        max_atoms=cfg.max_atoms,
-        datasets=datasets,
-        embed_batch_size=embed_batch_size,
+    return run_finetune_benchmark(
+        make_ae=make_ae, latent_dim=cfg.latent_dim,
+        featurize_fn=featurize_smiles, collate_fn=collate_fn,
+        device=device, max_atoms=cfg.max_atoms,
+        datasets=datasets, seeds=seeds, epochs=epochs,
+        batch_size=batch_size, lr=lr, dropout=dropout,
         train_smiles_path=train_smiles_path or None,
     )
-    return results
 
 
-# Reference numbers from the literature (scaffold split where reported).
-# These are NOT directly comparable due to differing splits/probes/seeds,
-# but they place our numbers in context.
-LITERATURE_REFERENCE = {
-    "BBBP":     {"MolBERT": 0.762, "ChemBERTa": 0.728, "MolCLR": 0.736, "Uni-Mol": 0.729, "Grover-Lg": 0.940},
-    "BACE":     {"MolBERT": 0.866, "ChemBERTa": 0.799, "MolCLR": 0.824, "Uni-Mol": 0.857, "Grover-Lg": 0.878},
-    "ClinTox":  {"MolBERT": 0.732, "ChemBERTa": 0.733, "MolCLR": 0.911, "Uni-Mol": 0.919, "Grover-Lg": 0.812},
-    "HIV":      {"MolBERT": 0.783, "ChemBERTa": 0.622, "MolCLR": 0.780, "Uni-Mol": 0.808, "Grover-Lg": 0.802},
-    "ESOL":     {"MolBERT": 0.531, "MolCLR": 1.110, "Uni-Mol": 0.788, "Grover-Lg": 0.831},
-    "FreeSolv": {"MolBERT": 0.948, "MolCLR": 2.200, "Uni-Mol": 1.480, "Grover-Lg": 1.544},
-    "Lipo":     {"MolBERT": 0.560, "MolCLR": 0.789, "Uni-Mol": 0.603, "Grover-Lg": 0.560},
+# Mole-BERT Table 1 reference (ROC-AUC, scaffold split, fine-tuning, 10 seeds).
+MOLEBERT_REFERENCE = {
+    "Tox21": 0.768, "ToxCast": 0.643, "SIDER": 0.628, "ClinTox": 0.789,
+    "MUV": 0.786, "HIV": 0.782, "BBBP": 0.719, "BACE": 0.808,
 }
 
 
 @app.local_entrypoint()
-def moleculenet_benchmark(checkpoint: str = "",
-                           datasets: str = "BBBP,BACE,ClinTox,HIV,ESOL,FreeSolv,Lipo",
-                           train_smiles_path: str = ""):
-    """Linear-probe benchmark on MoleculeNet (scaffold split).
+def moleculenet_finetune(checkpoint: str = "",
+                         datasets: str = "BBBP,BACE,ClinTox,SIDER",
+                         seeds: str = "0,1,2",
+                         epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
+                         train_smiles_path: str = ""):
+    """Fine-tuning benchmark replicating Mole-BERT's protocol (Table 1).
 
-    Reports our model vs Morgan-FP baseline (apples-to-apples, computed in
-    the same pipeline) alongside published literature numbers (which may use
-    different splits/probes — see footnote).
+    Fine-tunes the pretrained encoder END-TO-END per dataset (scaffold 80/10/10,
+    test score at best-val epoch, mean±std over seeds). Directly comparable to
+    Mole-BERT's published fine-tuning numbers (Table 1).
 
-    If `train_smiles_path` is non-empty (default uses the canonical-SMILES
-    set under RUNS_DIR), benchmark molecules also seen during pre-training
-    are dropped before embedding to prevent leakage.
+    NOTE: our encoder needs 3D ETKDG featurization per molecule, so the big
+    sets (HIV 41K, MUV 93K, ToxCast 8.5K×617-task) are SLOW to featurize. Start
+    with the small/medium sets; add the big ones explicitly when ready. Defaults
+    to 3 seeds for turnaround — pass seeds=0,1,...,9 to match the paper's 10.
     """
     ckpt = checkpoint or f"{ZINC15_CKPT_DIR}/final.pt"
-    train_smis = train_smiles_path or f"{RUNS_DIR}/train_smiles_zinc15_5m.json.gz"
     ds_list = [d.strip() for d in datasets.split(",") if d.strip()]
-    print(f"[moleculenet_benchmark] ckpt={ckpt}")
-    print(f"  train SMILES leakage set: {train_smis}")
-    print(f"  datasets: {ds_list}")
-    res = moleculenet_benchmark_modal.remote(checkpoint=ckpt, datasets=ds_list,
-                                                train_smiles_path=train_smis)
+    seed_list = [int(s) for s in seeds.split(",") if s.strip()]
+    train_smis = train_smiles_path  # default empty: leakage filter only for single-task
+    print(f"[moleculenet_finetune] ckpt={ckpt}")
+    print(f"  datasets: {ds_list}   seeds: {seed_list}   epochs={epochs}")
+    res = moleculenet_finetune_modal.remote(
+        checkpoint=ckpt, datasets=ds_list, seeds=seed_list,
+        epochs=epochs, batch_size=batch_size, lr=lr,
+        train_smiles_path=train_smis,
+    )
 
-    # ── Print comparison table
-    print("\n" + "=" * 105)
-    print("  MoleculeNet — scaffold split, linear probe on frozen embeddings  "
-           "(leakage-filtered against ZINC15 5M train set)")
-    print("=" * 105)
-    print(f"  {'Dataset':<10}  {'Task':<7}  {'Metric':<7}  {'N':>5}  {'leak':>4}  "
-           f"{'OURS':>7}  {'Morgan':>7}  {'MolBERT':>7}  {'ChemBERTa':>9}  {'MolCLR':>7}  {'Uni-Mol':>7}")
-    print(f"  {'-'*10}  {'-'*7}  {'-'*7}  {'-'*5}  {'-'*4}  "
-           f"{'-'*7}  {'-'*7}  {'-'*7}  {'-'*9}  {'-'*7}  {'-'*7}")
+    print("\n" + "=" * 78)
+    print("  MoleculeNet — END-TO-END FINE-TUNING (scaffold 80/10/10, best-val epoch)")
+    print("  Directly comparable to Mole-BERT (ICLR 2023) Table 1.")
+    print("=" * 78)
+    print(f"  {'Dataset':<10}  {'Metric':<6}  {'#task':>5}  {'N':>6}  "
+           f"{'OURS (mean±std)':>18}  {'Mole-BERT':>9}")
+    print(f"  {'-'*10}  {'-'*6}  {'-'*5}  {'-'*6}  {'-'*18}  {'-'*9}")
     for r in res:
-        ref = LITERATURE_REFERENCE.get(r["dataset"], {})
-        def fmt(x): return f"{x:.4f}" if isinstance(x, (int, float)) else "  —  "
-        score_model = r['model']
-        score_fp = r['morgan_fp']
-        sm = f"{score_model:>7.4f}" if score_model == score_model else "    —  "  # NaN check
-        sf = f"{score_fp:>7.4f}" if score_fp == score_fp else "    —  "
-        print(f"  {r['dataset']:<10}  {r['task'][:5]:<7}  {r['metric']:<7}  "
-               f"{r['n_kept']:>5}  {r.get('n_dropped_leak', 0):>4}  "
-               f"{sm}  {sf}  "
-               f"{fmt(ref.get('MolBERT')):>7}  {fmt(ref.get('ChemBERTa')):>9}  "
-               f"{fmt(ref.get('MolCLR')):>7}  {fmt(ref.get('Uni-Mol')):>7}")
+        ref = MOLEBERT_REFERENCE.get(r["dataset"])
+        ref_s = f"{ref:.3f}" if ref is not None else "  —  "
+        ours = f"{r['mean']:.4f} ± {r['std']:.4f}"
+        print(f"  {r['dataset']:<10}  {r['metric']:<6}  {r['n_tasks']:>5}  "
+               f"{r['n_kept']:>6}  {ours:>18}  {ref_s:>9}")
     print()
     print("  Notes:")
-    print("    • OURS = MolStructAutoencoder (1-epoch ZINC15 5M) + LogReg/Ridge probe")
-    print("    • Morgan = 1024-bit r=2 fingerprint + same probe (apples-to-apples baseline)")
-    print("    • Classification metric is AUROC (↑ better); regression is RMSE (↓ better)")
-    print("    • Literature numbers from each paper's reported scaffold-split scores.")
-    print("      Splits/probes/seeds differ; treat as ballpark, not direct comparison.")
-
-
-@app.local_entrypoint()
-def perturbation_smoke(checkpoint: str = ""):
-    """Smoke-test the embedding under four classes of single-atom-group edits.
-
-    Each row: (description, base SMILES, perturbed SMILES). The model should
-    assign HIGH cosine for similar pairs and LOW cosine for unrelated baselines.
-    """
-    ckpt = checkpoint or f"{ZINC15_CKPT_DIR}/final.pt"
-
-    pairs = [
-        # ── METHYLENE (+CH2 in middle / chain) ─────────────────────────────────
-        ["[CH2] pentane → hexane",
-            "CCCCC", "CCCCCC"],
-        ["[CH2] phenylacetic → 3-phenylpropanoic acid",
-            "OC(=O)Cc1ccccc1", "OC(=O)CCc1ccccc1"],
-        ["[CH2] aspirin → homoaspirin (extra CH2 in acetyl)",
-            "CC(=O)Oc1ccccc1C(=O)O", "CCC(=O)Oc1ccccc1C(=O)O"],
-
-        # ── METHYL (+CH3 at a terminal / on a ring) ────────────────────────────
-        ["[CH3] benzene → toluene",
-            "c1ccccc1", "Cc1ccccc1"],
-        ["[CH3] theobromine → caffeine (N-methyl)",
-            "CN1C=NC2=C1C(=O)NC(=O)N2C",
-            "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"],
-        ["[CH3] aspirin → 5-methylaspirin",
-            "CC(=O)Oc1ccccc1C(=O)O", "CC(=O)Oc1cc(C)ccc1C(=O)O"],
-
-        # ── HALOGEN swap (F → Cl → Br) ────────────────────────────────────────
-        ["[halogen] fluorobenzene → chlorobenzene",
-            "Fc1ccccc1", "Clc1ccccc1"],
-        ["[halogen] chlorobenzene → bromobenzene",
-            "Clc1ccccc1", "Brc1ccccc1"],
-        ["[halogen] 4-F-toluene → 4-Br-toluene",
-            "Cc1ccc(F)cc1", "Cc1ccc(Br)cc1"],
-
-        # ── PHENYL (+ benzene ring) ────────────────────────────────────────────
-        ["[phenyl] toluene → biphenyl-methyl",
-            "Cc1ccccc1", "Cc1ccc(-c2ccccc2)cc1"],
-        ["[phenyl] ethanol → 2-phenylethanol",
-            "CCO", "OCCc1ccccc1"],
-        ["[phenyl] aspirin → 4-phenyl-aspirin",
-            "CC(=O)Oc1ccccc1C(=O)O", "CC(=O)Oc1ccc(-c2ccccc2)cc1C(=O)O"],
-
-        # ── IDENTITY baseline (should be ≈ 1.0) ────────────────────────────────
-        ["[identity] aspirin == aspirin",
-            "CC(=O)Oc1ccccc1C(=O)O", "CC(=O)Oc1ccccc1C(=O)O"],
-
-        # ── UNRELATED baseline (should be << any above) ────────────────────────
-        ["[unrelated] aspirin vs glucose",
-            "CC(=O)Oc1ccccc1C(=O)O", "OCC1OC(O)C(O)C(O)C1O"],
-        ["[unrelated] aspirin vs ethanol",
-            "CC(=O)Oc1ccccc1C(=O)O", "CCO"],
-        ["[unrelated] caffeine vs glucose",
-            "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", "OCC1OC(O)C(O)C(O)C1O"],
-    ]
-
-    print(f"[perturbation_smoke] ckpt={ckpt}  pairs={len(pairs)}")
-    res = pair_compare_modal.remote(checkpoint=ckpt, pairs=pairs)
-
-    # Group by category prefix for readability
-    print()
-    print(f"  {'category':<10}  {'cosine':>7}  {'description':<55}")
-    print(f"  {'-'*10}  {'-'*7}  {'-'*55}")
-    last_cat = None
-    for r in res:
-        cat = r["label"].split("]")[0].strip("[")
-        if last_cat is not None and cat != last_cat:
-            print()
-        last_cat = cat
-        desc = r["label"].split("] ", 1)[-1]
-        cos_s = f"{r['cosine']:+.4f}" if r["cosine"] is not None else "  N/A "
-        print(f"  {cat:<10}  {cos_s:>7}  {desc:<55}")
+    print("    • OURS = pretrained Pairformer encoder + linear head, fine-tuned end-to-end.")
+    print("    • Mole-BERT col = their Table 1 ROC-AUC (GIN backbone, 10 seeds).")
+    print("    • Classification = AUROC (↑); regression = RMSE (↓).")
+    print("    • Same protocol (scaffold 80/10/10, best-val epoch) — directly comparable,")
+    print("      modulo backbone (Pairformer vs GIN) and pretraining set (ZINC15 5M vs 2M).")
 
 
 # ─── ZINC15 10M pipeline (fetch → featurize → train, all on Modal) ──────────────

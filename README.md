@@ -50,9 +50,8 @@ This README covers:
 3. [Featurization](#featurization) — how raw molecules are turned into `MolSample`s and sharded to disk.
 4. [Training](#training) — stage 1 (mol_struct_ae) and stage 2 (distillation).
 5. [Inference and similarity](#inference) — embedding any SMILES with the distillation model.
-6. [Repo layout and running](#repo-layout) — also covers the four bundled
-   benchmark suites (MoleculeNet, MoleculeACE, HTS virtual-screening,
-   perturbation smoke test), all leakage-filtered against the training set.
+6. [Repo layout and running](#repo-layout) — also covers the MoleculeNet
+   fine-tuning benchmark, leakage-filtered against the training set.
 
 ---
 
@@ -535,10 +534,10 @@ mol_struct_ae/                            ← repo root
 │   ├── parallel_featurize.py       ← multithreaded featurize_smiles_parallel()
 │   ├── feature_utils.py            ← featurize_all / embed_all / embed_from_shards /
 │   │                                 morgan_fps / tanimoto_matrix
-│   ├── moleculenet_benchmark.py    ← MoleculeNet scaffold-split linear probe
-│   │                                 + leakage filter against training-SMILES set
-│   ├── moleculeace_benchmark.py    ← MoleculeACE activity-cliff RMSE probe
-│   └── litpcba_benchmark.py        ← Virtual-screening EF@K via PyTDC HTS datasets
+│   └── benchmark_moleculenet.py    ← MoleculeNet END-TO-END FINE-TUNING benchmark
+│                                     (Hu et al. / Mole-BERT protocol: scaffold
+│                                     80/10/10, best-val epoch, multi-seed, multi-task;
+│                                     self-contained — download + leakage helpers inline)
 │
 ├── scripts/
 │   ├── build_vocab.py                          ← build SMILES vocab from CSV
@@ -551,8 +550,8 @@ mol_struct_ae/                            ← repo root
 │                                           mol_struct_ae embeddings
 │
 ├── modal_mol_struct_ae.py                ← Modal pipeline: featurize, train, simsearch,
-│                                           benchmarks (MoleculeNet, MoleculeACE, LIT-PCBA
-│                                           via TDC HTS), index cache, leakage extractor
+│                                           MoleculeNet fine-tuning benchmark, index
+│                                           cache, leakage extractor
 ├── modal_distillation.py                 ← Modal pipeline: precompute_embeds + train
 └── modal_simsearch.py                    ← Modal simsearch runner (uses distillation)
 ```
@@ -633,49 +632,31 @@ MODAL_PROFILE=<profile> python -m modal run --detach \
     modal_mol_struct_ae.py::index_cache --max-atoms 64
 
 # Extract the deduplicated canonical-SMILES set of the training data
-# (used by all benchmark suites for leakage filtering):
+# (used by the MoleculeNet benchmark for leakage filtering):
 MODAL_PROFILE=<profile> python -m modal run --detach \
     modal_mol_struct_ae.py::extract_train_smiles
 ```
 
 ### Benchmarking
 
-Four benchmark suites are wired up as Modal entrypoints — all use **frozen
-embeddings** from the trained `final.pt` and run a Morgan-FP baseline side by
-side for apples-to-apples comparison. Each one is **leakage-filtered** against
-the canonical-SMILES set extracted from the training shards. Note that this model was developed mainly for fast and lightweight simsearching, NOT property prediction. Take benchmark results with a grain of salt; these were just done in terms of curiosity.
+One benchmark is wired up as a Modal entrypoint: **MoleculeNet end-to-end
+fine-tuning** (the Mole-BERT / Hu et al. protocol). It is **leakage-filtered**
+against the canonical-SMILES set from the training shards. 
 
 ```bash
-# 1. MoleculeNet — scaffold split, linear probe, AUROC/RMSE per dataset.
-#    BBBP, BACE, ClinTox, HIV, ESOL, FreeSolv, Lipo.
+# MoleculeNet — END-TO-END FINE-TUNING (scaffold 80/10/10, best-val epoch,
+# multi-seed mean±std). Replicates Mole-BERT (ICLR 2023) Table 1, so the
+# numbers are directly comparable. Single- and multi-task datasets:
+# BBBP, BACE, ClinTox, SIDER, Tox21, ToxCast, MUV, HIV.
 MODAL_PROFILE=<profile> python -m modal run \
-    modal_mol_struct_ae.py::moleculenet_benchmark
-
-# 2. MoleculeACE — activity-cliff RMSE on 8 ChEMBL targets.
-#    Tests whether the embedding handles structurally-similar / activity-different
-#    pairs that fingerprint-only models traditionally fail on.
-MODAL_PROFILE=<profile> python -m modal run \
-    modal_mol_struct_ae.py::moleculeace_benchmark
-
-# 3. Virtual-screening EF@1% / EF@5% / AUROC on PyTDC's HTS PubChem-bioassay
-#    datasets. (PyTDC does not ship LIT-PCBA itself; these are the
-#    scientifically-equivalent HTS screens it does ship.)
-MODAL_PROFILE=<profile> python -m modal run \
-    modal_mol_struct_ae.py::litpcba_benchmark
-
-# 4. Perturbation smoke test — cosine similarity for curated pairs differing
-#    by one methyl / methylene / halogen / phenyl. Sanity check that the
-#    embedding's local neighborhood structure makes chemical sense.
-MODAL_PROFILE=<profile> python -m modal run \
-    modal_mol_struct_ae.py::perturbation_smoke
+    modal_mol_struct_ae.py::moleculenet_finetune \
+    --datasets BBBP,BACE,ClinTox,SIDER --seeds 0,1,2,3,4,5,6,7,8,9 --epochs 100
 ```
 
-The benchmark utilities (`utils/moleculenet_benchmark.py`,
-`utils/moleculeace_benchmark.py`, `utils/litpcba_benchmark.py`) all share the
-same featurization-and-leakage-filter pipeline. They use
-`utils/parallel_featurize.py` to multi-process RDKit ETKDG + MMFF across
-12 workers, then dense-batch the resulting `MolSample`s through the model
-on GPU.
+The benchmark featurizes once per dataset (RDKit ETKDG + MMFF) and reuses the
+`MolSample`s across all seeds. It's self-contained in
+`utils/benchmark_moleculenet.py` (dataset download + leakage-filter helpers
+are inline).
 
 Requirements: `torch >= 2.0`, `rdkit >= 2023.3.1`. No PyG dependency — the
 whole pipeline runs on dense batched tensors with `atom_mask`, with the
