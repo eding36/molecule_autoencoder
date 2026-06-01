@@ -50,8 +50,9 @@ This README covers:
 3. [Featurization](#featurization) — how raw molecules are turned into `MolSample`s and sharded to disk.
 4. [Training](#training) — stage 1 (mol_struct_ae) and stage 2 (distillation).
 5. [Inference and similarity](#inference) — embedding any SMILES with the distillation model.
-6. [Repo layout and running](#repo-layout) — also covers the MoleculeNet
-   fine-tuning benchmark, leakage-filtered against the training set.
+6. [Repo layout and running](#repo-layout) — also covers the unified
+   AE/Distill MoleculeNet fine-tuning benchmark (per-dataset split + metric
+   via `DATASET_PROTOCOL`, leakage-filtered against the training set).
 
 ---
 
@@ -535,9 +536,11 @@ mol_struct_ae/                            ← repo root
 │   ├── feature_utils.py            ← featurize_all / embed_all / embed_from_shards /
 │   │                                 morgan_fps / tanimoto_matrix
 │   └── benchmark_moleculenet.py    ← MoleculeNet END-TO-END FINE-TUNING benchmark
-│                                     (Hu et al. / Mole-BERT protocol: scaffold
-│                                     80/10/10, best-val epoch, multi-seed, multi-task;
-│                                     self-contained — download + leakage helpers inline)
+│                                     (Hu et al. / Mole-BERT protocol, per-dataset
+│                                     splits + metrics via DATASET_PROTOCOL; unified
+│                                     AEBackend / DistillBackend so the same harness
+│                                     runs both stage-1 and stage-2 checkpoints;
+│                                     download + leakage helpers inline)
 │
 ├── scripts/
 │   ├── build_vocab.py                          ← build SMILES vocab from CSV
@@ -639,22 +642,69 @@ MODAL_PROFILE=<profile> python -m modal run --detach \
 
 ### Benchmarking
 
-One benchmark is wired up as a Modal entrypoint: **MoleculeNet end-to-end
-fine-tuning** (the Mole-BERT / Hu et al. protocol). It is **leakage-filtered**
-against the canonical-SMILES set from the training shards. 
+Both stages share a single benchmark harness (**MoleculeNet end-to-end
+fine-tuning**, Hu et al. / Mole-BERT protocol), wired up as two Modal
+entrypoints — one per backend — both backed by the same code in
+`utils/benchmark_moleculenet.py`. Each backend implements a small protocol
+(`prepare(smiles)` → opaque featurized blob; `build_finetune_model()` → a
+wrapper that maps `(prepared, indices) → logits`), so adding a new encoder is
+a ~20-line class:
+
+  - **`AEBackend`** — runs RDKit featurization, freezes the Pairformer
+    autoencoder, fine-tunes an MLP head on top of the latent + 5 context
+    tokens.
+  - **`DistillBackend`** — tokenizes SMILES with `SmilesTokenizer`, freezes
+    the distillation transformer, fine-tunes an MLP head on the CLS embedding.
+    ~50× faster end-to-end than the AE backend (no RDKit, no conformer gen).
+
+Both backends are **leakage-filtered** against the canonical-SMILES set from
+the training shards.
+
+#### Per-dataset split & metric
+
+The default protocol per dataset (overridable via CLI) is encoded in
+`DATASET_PROTOCOL` in `utils/benchmark_moleculenet.py`:
+
+| Dataset | Split | Metric | Rationale |
+|---|---|---|---|
+| BBBP, BACE, HIV | scaffold 80/10/10 (random per seed) | ROC-AUC | structural-novelty generalization — labels depend strongly on the molecular core, so scaffold-disjoint test sets are the meaningful difficulty knob |
+| Tox21, ToxCast, SIDER, ClinTox | random 80/10/10 | ROC-AUC | broad multi-task assays — labels are receptor/toxicity-driven, scaffold-disjointness over-penalizes; matches the original MoleculeNet release |
+| MUV | random 80/10/10 | **AUPRC** | extreme positive imbalance (~0.2% positives) — AUROC saturates near 1.0 and is uninformative, so AP is the canonical metric for this set |
+| ESOL, FreeSolv, Lipo | scaffold 80/10/10 | RMSE | regression sets — scaffold split is the convention |
+
+ClinTox warrants a callout: deterministic largest-first scaffold splitting
+puts the few class-positive scaffolds in a single split and produces
+sub-random AUROC. We use **per-seed random scaffold splitting** for
+scaffold-mode datasets (`random_scaffold_split_3way`, equivalent to
+DeepChem's `RandomGroupSplitter`), which is what Mole-BERT actually reports.
+
+#### Running the benchmark
 
 ```bash
-# MoleculeNet — END-TO-END FINE-TUNING (scaffold 80/10/10, best-val epoch,
-# multi-seed mean±std). Replicates Mole-BERT (ICLR 2023) Table 1, so the
-# numbers are directly comparable. Single- and multi-task datasets:
-# BBBP, BACE, ClinTox, SIDER, Tox21, ToxCast, MUV, HIV.
-MODAL_PROFILE=<profile> python -m modal run \
+# Stage 1 — AE-backbone fine-tune (slow: RDKit featurization dominates).
+MODAL_PROFILE=<profile> python -m modal run --detach \
     modal_mol_struct_ae.py::moleculenet_finetune \
-    --datasets BBBP,BACE,ClinTox,SIDER --seeds 0,1,2,3,4,5,6,7,8,9 --epochs 100
+    --datasets BBBP,BACE,HIV,Tox21,ToxCast,SIDER,ClinTox,MUV \
+    --seeds 0,1,2 --epochs 100
+
+# Stage 2 — distillation-backbone fine-tune (fast: no featurization, ~1 ms/mol).
+MODAL_PROFILE=<profile> python -m modal run --detach \
+    modal_distillation.py::moleculenet_finetune_distill \
+    --distill-ckpt /root/runs/distill/best.pt \
+    --vocab-path /root/mol_struct_ae/runs/vocab.json \
+    --datasets BBBP,BACE,HIV,Tox21,ToxCast,SIDER,ClinTox,MUV \
+    --seeds 0,1,2 --epochs 100
+
+# Override the per-dataset split (e.g. force scaffold across the run):
+MODAL_PROFILE=<profile> python -m modal run --detach \
+    modal_distillation.py::moleculenet_finetune_distill \
+    --datasets BBBP,BACE --seeds 0,1,2 --epochs 100 \
+    --split-override scaffold
 ```
 
-The benchmark featurizes once per dataset (RDKit ETKDG + MMFF) and reuses the
-`MolSample`s across all seeds. It's self-contained in
+The AE backend featurizes once per dataset (RDKit ETKDG + MMFF) and reuses
+the `MolSample`s across all seeds. The distillation backend tokenizes once
+and reuses the token IDs. Both are self-contained in
 `utils/benchmark_moleculenet.py` (dataset download + leakage-filter helpers
 are inline).
 

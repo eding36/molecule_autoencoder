@@ -223,7 +223,7 @@ def moleculenet_finetune_distill_modal(
     distill_ckpt: str, vocab_path: str, datasets: list, seeds: list,
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     dropout: float = 0.5, train_smiles_path: str = "",
-    split_strategy: str = "deterministic",
+    split_override: str = "",
 ) -> list:
     import os, sys, subprocess
     sys.path.insert(0, REMOTE_DIR)
@@ -244,7 +244,7 @@ def moleculenet_finetune_distill_modal(
         backend, datasets=datasets, seeds=seeds, epochs=epochs,
         batch_size=batch_size, lr=lr, dropout=dropout,
         train_smiles_path=train_smiles_path or None,
-        split_strategy=split_strategy,
+        split_override=split_override or None,
     )
 
 
@@ -263,27 +263,30 @@ def moleculenet_finetune_distill(
     seeds: str = "0,1,2",
     epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
     train_smiles_path: str = "",
-    split_strategy: str = "deterministic",
+    split_override: str = "",
 ):
     """Fine-tune the SMILES-only distillation encoder on MoleculeNet.
 
     Identical protocol to `modal_mol_struct_ae.py::moleculenet_finetune` (Hu
-    et al. / Mole-BERT: scaffold 80/10/10, end-to-end fine-tuning, best-val
-    epoch, mean±std). But uses the distillation `SmilesEncoder` as backbone —
-    no RDKit featurization needed, ~100× faster per molecule on the forward
-    pass. Same fine-tuning protocol = directly comparable AUROCs.
+    et al. / Mole-BERT: end-to-end fine-tuning, best-val epoch, mean±std).
+    Per-dataset split/metric come from `utils.benchmark_moleculenet.DATASET_PROTOCOL`
+    (scaffold + ROC-AUC for BBBP/BACE/HIV; random + ROC-AUC for Tox21/ToxCast/
+    SIDER/ClinTox; random + AUPRC for MUV). Uses the distillation
+    `SmilesEncoder` as backbone — no RDKit featurization needed, ~100× faster
+    per molecule than the AE backend; same fine-tuning protocol means numbers
+    are directly comparable to the AE benchmark.
     """
     ds_list = [d.strip() for d in datasets.split(",") if d.strip()]
     seed_list = [int(s) for s in seeds.split(",") if s.strip()]
     print(f"[moleculenet_finetune_distill] ckpt={distill_ckpt}")
     print(f"  vocab={vocab_path}   datasets={ds_list}   seeds={seed_list}")
-    print(f"  split_strategy={split_strategy}")
+    print(f"  split_override={split_override or '(per-dataset DATASET_PROTOCOL)'}")
     res = moleculenet_finetune_distill_modal.remote(
         distill_ckpt=distill_ckpt, vocab_path=vocab_path,
         datasets=ds_list, seeds=seed_list,
         epochs=epochs, batch_size=batch_size, lr=lr,
         train_smiles_path=train_smiles_path,
-        split_strategy=split_strategy,
+        split_override=split_override or None,
     )
     print("\n" + "=" * 78)
     print("  MoleculeNet — DISTILL SmilesEncoder END-TO-END FINE-TUNING")

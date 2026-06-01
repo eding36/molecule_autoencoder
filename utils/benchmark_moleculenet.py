@@ -40,7 +40,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from rdkit import Chem, RDLogger
 from rdkit.Chem.Scaffolds import MurckoScaffold
-from sklearn.metrics import mean_squared_error, roc_auc_score
+from sklearn.metrics import (average_precision_score, mean_squared_error,
+                              roc_auc_score)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -149,6 +150,34 @@ DATASETS: Dict[str, dict] = {
 }
 
 
+# Per-dataset canonical MoleculeNet protocols (split + primary metric):
+#  * scaffold split for the structurally-driven tasks (BBBP, BACE, HIV) — labels
+#    depend on 2D/3D structure, so scaffold-disjoint splits test generalization
+#    to novel cores.
+#  * random split for the broad-assay multi-task sets (Tox21, ToxCast, SIDER,
+#    ClinTox, MUV) — labels are receptor/toxicity-driven, scaffold-disjointness
+#    over-penalizes; random split matches how MoleculeNet originally reported.
+#  * AUPRC for MUV (extreme imbalance, AUROC is misleading near 1.0 on rare
+#    positives); AUROC for everything else.
+DATASET_PROTOCOL = {
+    # classification — scaffold split, ROC-AUC
+    "BBBP":    {"split": "scaffold", "metric": "auroc"},
+    "BACE":    {"split": "scaffold", "metric": "auroc"},
+    "HIV":     {"split": "scaffold", "metric": "auroc"},
+    # classification — random split, ROC-AUC
+    "Tox21":   {"split": "random",   "metric": "auroc"},
+    "ToxCast": {"split": "random",   "metric": "auroc"},
+    "SIDER":   {"split": "random",   "metric": "auroc"},
+    "ClinTox": {"split": "random",   "metric": "auroc"},
+    # classification — random split, AUPRC (extreme imbalance)
+    "MUV":     {"split": "random",   "metric": "auprc"},
+    # regression — scaffold split, RMSE (sane default for the regression sets)
+    "ESOL":    {"split": "scaffold", "metric": "rmse"},
+    "FreeSolv":{"split": "scaffold", "metric": "rmse"},
+    "Lipo":    {"split": "scaffold", "metric": "rmse"},
+}
+
+
 def load_dataset_multitask(name: str) -> Tuple[List[str], np.ndarray, str, List[str]]:
     """Returns (smiles, Y[N, T], task, task_names). Missing labels are NaN."""
     cfg = DATASETS[name]
@@ -221,6 +250,25 @@ def scaffold_split_3way(smiles: List[str], frac_train: float = 0.8,
         else:
             test.extend(g)
     return train, val, test
+
+
+def random_split_3way(n: int, seed: int,
+                       frac_train: float = 0.8, frac_val: float = 0.1
+                       ) -> Tuple[List[int], List[int], List[int]]:
+    """Pure-random 80/10/10 index permutation — NOT scaffold-disjoint.
+
+    The MoleculeNet-recommended protocol for datasets where the labels are
+    not driven by structural-novelty generalization: Tox21, ToxCast, SIDER,
+    ClinTox, MUV. For these, scaffold-disjointness over-penalizes — random
+    splitting matches the way these labels are actually used in practice.
+    """
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n).tolist()
+    n_train = int(frac_train * n)
+    n_val = int(frac_val * n)
+    return (perm[:n_train],
+            perm[n_train:n_train + n_val],
+            perm[n_train + n_val:])
 
 
 def random_scaffold_split_3way(
@@ -353,11 +401,16 @@ def _multitask_bce(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def _evaluate(model: nn.Module, prepared, Y: np.ndarray, idx, task: str,
-              batch_size: int = 128) -> Tuple[float, float]:
-    """Returns (primary_metric, val_loss). primary_metric is ROC-AUC (cls) or
-    RMSE (reg). val_loss is masked BCE (cls) or MSE (reg) — always defined,
-    used as fallback selection when ROC-AUC is undefined on a degenerate
-    (single-class) val split. `model(prepared, indices)` must return logits.
+              metric: str = "auroc", batch_size: int = 128) -> Tuple[float, float]:
+    """Returns (primary_metric, val_loss).
+
+    `metric` selects the classification metric: "auroc" (default) or "auprc"
+    (used for MUV, where extreme imbalance makes AUROC near-trivially high).
+    For regression, both returns are RMSE.
+
+    val_loss is always-defined masked BCE (cls) / MSE (reg) — used as fallback
+    selection when the primary metric is undefined on a degenerate val split.
+    `model(prepared, indices)` must return logits.
     """
     model.eval()
     preds: List[np.ndarray] = []
@@ -370,19 +423,21 @@ def _evaluate(model: nn.Module, prepared, Y: np.ndarray, idx, task: str,
     if task == "regression":
         rmse = float(np.sqrt(mean_squared_error(Yt[:, 0], P[:, 0])))
         return rmse, rmse
+    # classification
     mask = ~np.isnan(Yt)
     y_safe = np.nan_to_num(Yt, nan=0.0)
     z = P
     bce = np.maximum(z, 0) - z * y_safe + np.log1p(np.exp(-np.abs(z)))
     loss = float((bce * mask).sum() / max(mask.sum(), 1))
-    aucs: List[float] = []
+    scorer = average_precision_score if metric == "auprc" else roc_auc_score
+    scores: List[float] = []
     for t in range(Y.shape[1]):
         yt = Yt[:, t]; m = ~np.isnan(yt)
         if m.sum() == 0 or len(np.unique(yt[m])) < 2:
             continue
-        aucs.append(roc_auc_score(yt[m], P[m, t]))
-    auc = float(np.mean(aucs)) if aucs else float("nan")
-    return auc, loss
+        scores.append(scorer(yt[m], P[m, t]))
+    val = float(np.mean(scores)) if scores else float("nan")
+    return val, loss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -513,8 +568,8 @@ class DistillBackend:
 def finetune_once(backend, prepared, Y: np.ndarray, splits, task: str,
                   device: torch.device, seed: int, n_tasks: int,
                   epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
-                  dropout: float = 0.5) -> float:
-    """One fine-tuning run. Returns TEST score at the best-VAL epoch."""
+                  dropout: float = 0.5, metric: str = "auroc") -> float:
+    """One fine-tuning run. Returns TEST score (in `metric`) at the best-VAL epoch."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     tr, va, te = splits
@@ -549,17 +604,17 @@ def finetune_once(backend, prepared, Y: np.ndarray, splits, task: str,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-        val_metric, val_loss = _evaluate(model, prepared, Y, va, task)
+        val_metric, val_loss = _evaluate(model, prepared, Y, va, task, metric=metric)
         if task == "classification" and not np.isnan(val_metric):
             auc_ever_defined = True
             if val_metric > best_auc:
                 best_auc = val_metric
-                test_metric, _ = _evaluate(model, prepared, Y, te, task)
+                test_metric, _ = _evaluate(model, prepared, Y, te, task, metric=metric)
                 best_test = test_metric
         else:
             if not auc_ever_defined and val_loss < best_loss:
                 best_loss = val_loss
-                test_metric, _ = _evaluate(model, prepared, Y, te, task)
+                test_metric, _ = _evaluate(model, prepared, Y, te, task, metric=metric)
                 best_test = test_metric
     return best_test
 
@@ -569,15 +624,22 @@ def run_finetune_benchmark(backend, datasets: List[str], seeds: List[int],
                            epochs: int = 100, batch_size: int = 32,
                            lr: float = 1e-3, dropout: float = 0.5,
                            train_smiles_path: Optional[str] = None,
-                           split_strategy: str = "deterministic") -> List[dict]:
-    """split_strategy:
-        "deterministic"   (default) — largest-first Bemis-Murcko scaffold split
-                          with a one-shot stratification pass; same split for
-                          all seeds. Matches Hu et al. 2020.
-        "random_per_seed" — per-seed-shuffled Bemis-Murcko scaffold split.
-                          Different seeds → different splits. Matches Mole-BERT
-                          and DeepChem's `RandomGroupSplitter`. Needed for
-                          datasets with extreme class imbalance (e.g. ClinTox).
+                           split_override: Optional[str] = None,
+                           metric_override: Optional[str] = None) -> List[dict]:
+    """Each dataset is run under its canonical MoleculeNet protocol from
+    `DATASET_PROTOCOL`. `split_override` / `metric_override` force the same
+    protocol on every dataset for ablation studies (e.g. "all scaffold"
+    comparisons).
+
+    Splits:
+      "scaffold" — Bemis-Murcko scaffold groups, per-seed-shuffled (DeepChem
+                   `RandomGroupSplitter`). Scaffold-disjoint within a seed.
+      "random"   — pure-random index permutation per seed. Not
+                   scaffold-disjoint. The canonical MoleculeNet protocol
+                   for the broad-assay multi-task sets.
+
+    Metrics: "auroc" (default for classification), "auprc" (MUV), "rmse"
+             (regression — selected automatically when task=="regression").
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -600,38 +662,43 @@ def run_finetune_benchmark(backend, datasets: List[str], seeds: List[int],
             Y = y1.reshape(-1, 1)
             print(f"[{name}] leakage filter: dropped {n_leak}/{n_raw}")
 
-        print(f"[{name}] {n_raw} mols, {len(task_names)} task(s); preparing …")
+        # Resolve protocol for this dataset
+        proto = DATASET_PROTOCOL.get(name, {"split": "scaffold", "metric": "auroc"})
+        ds_split = split_override or proto["split"]
+        ds_metric = (metric_override or proto["metric"]) if task == "classification" else "rmse"
+        print(f"[{name}] {n_raw} mols, {len(task_names)} task(s); "
+               f"protocol: split={ds_split} metric={ds_metric}")
+
         keep_idx, prepared = backend.prepare(smis, device)
         smis_kept = [smis[i] for i in keep_idx]
         Y_kept = Y[keep_idx]
         print(f"[{name}] kept {len(smis_kept)}/{n_raw} after prepare")
 
-        if split_strategy == "deterministic":
-            tr, va, te = stratified_scaffold_split_3way(smis_kept, Y_kept)
-            print(f"[{name}] scaffold 80/10/10 (deterministic) → "
-                   f"train={len(tr)} val={len(va)} test={len(te)}")
-
         scores: List[float] = []
         last_tr = last_va = last_te = []
         for sd in seeds:
-            if split_strategy == "random_per_seed":
+            if ds_split == "scaffold":
                 tr, va, te = random_scaffold_split_3way(smis_kept, seed=sd)
-                print(f"[{name}] scaffold 80/10/10 (random, seed={sd}) → "
-                       f"train={len(tr)} val={len(va)} test={len(te)}")
+            elif ds_split == "random":
+                tr, va, te = random_split_3way(len(smis_kept), seed=sd)
+            else:
+                raise ValueError(f"unknown split {ds_split!r} for {name}")
+            print(f"[{name}] 80/10/10 ({ds_split}, seed={sd}) → "
+                   f"train={len(tr)} val={len(va)} test={len(te)}")
             last_tr, last_va, last_te = tr, va, te
             s = finetune_once(backend, prepared, Y_kept, (tr, va, te), task,
                               device, seed=sd, n_tasks=Y_kept.shape[1],
                               epochs=epochs, batch_size=batch_size, lr=lr,
-                              dropout=dropout)
+                              dropout=dropout, metric=ds_metric)
             scores.append(s)
             print(f"[{name}] seed={sd} test={s:.4f}")
         arr = np.array(scores, dtype=np.float64)
-        metric = "AUROC" if task == "classification" else "RMSE"
-        print(f"[{name}] {metric} = {np.nanmean(arr):.4f} ± {np.nanstd(arr):.4f} "
+        metric_label = {"auroc": "AUROC", "auprc": "AUPRC", "rmse": "RMSE"}[ds_metric]
+        print(f"[{name}] {metric_label} = {np.nanmean(arr):.4f} ± {np.nanstd(arr):.4f} "
                f"over {len(seeds)} seeds  ({time.time()-t0:.0f}s)")
         results.append({
-            "dataset": name, "task": task, "metric": metric,
-            "split_strategy": split_strategy,
+            "dataset": name, "task": task, "metric": metric_label,
+            "split": ds_split,
             "n_tasks": Y_kept.shape[1], "n_kept": len(smis_kept),
             "n_train": len(last_tr), "n_val": len(last_va), "n_test": len(last_te),
             "mean": float(np.nanmean(arr)), "std": float(np.nanstd(arr)),

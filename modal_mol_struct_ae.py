@@ -528,7 +528,7 @@ def moleculenet_finetune_modal(checkpoint: str, datasets: list, seeds: list,
                                 epochs: int = 100, batch_size: int = 32,
                                 lr: float = 1e-3, dropout: float = 0.5,
                                 train_smiles_path: str = "",
-                                split_strategy: str = "deterministic") -> list:
+                                split_override: str = "") -> list:
     import sys
     sys.path.insert(0, REMOTE_DIR)
     from utils.benchmark_moleculenet import AEBackend, run_finetune_benchmark
@@ -538,7 +538,7 @@ def moleculenet_finetune_modal(checkpoint: str, datasets: list, seeds: list,
         backend, datasets=datasets, seeds=seeds, epochs=epochs,
         batch_size=batch_size, lr=lr, dropout=dropout,
         train_smiles_path=train_smiles_path or None,
-        split_strategy=split_strategy,
+        split_override=split_override or None,
     )
 
 
@@ -555,12 +555,14 @@ def moleculenet_finetune(checkpoint: str = "",
                          seeds: str = "0,1,2",
                          epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
                          train_smiles_path: str = "",
-                         split_strategy: str = "deterministic"):
+                         split_override: str = ""):
     """Fine-tuning benchmark replicating Mole-BERT's protocol (Table 1).
 
-    Fine-tunes the pretrained encoder END-TO-END per dataset (scaffold 80/10/10,
-    test score at best-val epoch, mean±std over seeds). Directly comparable to
-    Mole-BERT's published fine-tuning numbers (Table 1).
+    Fine-tunes the pretrained encoder END-TO-END per dataset (80/10/10,
+    test score at best-val epoch, mean±std over seeds). Per-dataset split
+    and metric come from `utils.benchmark_moleculenet.DATASET_PROTOCOL`
+    (scaffold + ROC-AUC for BBBP/BACE/HIV; random + ROC-AUC for Tox21/ToxCast/
+    SIDER/ClinTox; random + AUPRC for MUV) — matches Mole-BERT Table 1.
 
     NOTE: our encoder needs 3D ETKDG featurization per molecule, so the big
     sets (HIV 41K, MUV 93K, ToxCast 8.5K×617-task) are SLOW to featurize. Start
@@ -573,16 +575,16 @@ def moleculenet_finetune(checkpoint: str = "",
     train_smis = train_smiles_path  # default empty: leakage filter only for single-task
     print(f"[moleculenet_finetune] ckpt={ckpt}")
     print(f"  datasets: {ds_list}   seeds: {seed_list}   epochs={epochs}")
-    print(f"  split_strategy: {split_strategy}")
+    print(f"  split_override: {split_override or '(per-dataset DATASET_PROTOCOL)'}")
     res = moleculenet_finetune_modal.remote(
         checkpoint=ckpt, datasets=ds_list, seeds=seed_list,
         epochs=epochs, batch_size=batch_size, lr=lr,
         train_smiles_path=train_smis,
-        split_strategy=split_strategy,
+        split_override=split_override,
     )
 
     print("\n" + "=" * 78)
-    print("  MoleculeNet — END-TO-END FINE-TUNING (scaffold 80/10/10, best-val epoch)")
+    print("  MoleculeNet — END-TO-END FINE-TUNING (per-dataset DATASET_PROTOCOL, best-val epoch)")
     print("  Directly comparable to Mole-BERT (ICLR 2023) Table 1.")
     print("=" * 78)
     print(f"  {'Dataset':<10}  {'Metric':<6}  {'#task':>5}  {'N':>6}  "
