@@ -1,0 +1,27 @@
+Note that running a local entrypoint in detached mode only keeps the last triggered Modal function alive after the parent process has been killed or disconnected.
+✓ Initialized. View run at 
+https://modal.com/apps/eding3602/main/ap-3WDeWTkNI1qR3MIlWrurp2
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/eding36/VSCodeProjects/mol_struct_ae/modal_distillation.py
+├── 🔨 Created mount /Users/eding36/VSCodeProjects/mol_struct_ae
+├── 🔨 Created function precompute_partition_modal.
+├── 🔨 Created function merge_pairs_modal.
+├── 🔨 Created function train_distill_modal.
+└── 🔨 Created function moleculenet_finetune_distill_modal.
+[moleculenet_finetune_distill] ckpt=/root/runs/distill/best.pt
+  vocab=/root/mol_struct_ae/runs/vocab.json   datasets=['HIV', 'Tox21', 'ToxCast', 'SIDER', 'ClinTox', 'MUV']   seeds=[0, 1, 2]
+  split_override=(per-dataset DATASET_PROTOCOL)
+[ft-distill] vocab not found at /root/mol_struct_ae/runs/vocab.json; building from CSV
+[vocab] read 249455 SMILES from /root/mol_struct_ae/data/zinc250k.csv
+[vocab] size=65 max_len=128 max_seen_len=70 oversized@50k=0
+[vocab] saved → /root/mol_struct_ae/runs/vocab.json
+[DistillBackend] ckpt step=36748 hidden=256 layers=6 output_dim=256  val_cos_loss(best)=0.03689250063399474
+
+[HIV] downloading + parsing …
+[download] https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/HIV.csv
+[HIV] 41127 mols, 1 task(s); protocol: split=scaffold metric=auroc
+[HIV] kept 41127/41127 after prepare
+[HIV] 80/10/10 (scaffold, seed=0) → train=32901 val=4112 test=4114
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")

@@ -6,7 +6,6 @@ __pycache__/
 *.pyo
 
 # Training / data outputs (large, regenerable)
-runs/
 data/shards*/
 *.pt
 

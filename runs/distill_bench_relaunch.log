@@ -1,0 +1,109 @@
+Note that running a local entrypoint in detached mode only keeps the last triggered Modal function alive after the parent process has been killed or disconnected.
+✓ Initialized. View run at 
+https://modal.com/apps/eding3602/main/ap-6BYWxUsCcmjuffR3GoGUQh
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/eding36/VSCodeProjects/mol_struct_ae/modal_distillation.py
+├── 🔨 Created mount /Users/eding36/VSCodeProjects/mol_struct_ae
+├── 🔨 Created function precompute_partition_modal.
+├── 🔨 Created function merge_pairs_modal.
+├── 🔨 Created function train_distill_modal.
+└── 🔨 Created function moleculenet_finetune_distill_modal.
+[moleculenet_finetune_distill] ckpt=/root/runs/distill/best.pt
+  vocab=/root/mol_struct_ae/runs/vocab.json   datasets=['BBBP', 'BACE', 'HIV', 'Tox21', 'ToxCast', 'SIDER', 'ClinTox', 'MUV']   seeds=[0, 1, 2]
+  split_override=(per-dataset DATASET_PROTOCOL)
+[ft-distill] vocab not found at /root/mol_struct_ae/runs/vocab.json; building from CSV
+[vocab] read 249455 SMILES from /root/mol_struct_ae/data/zinc250k.csv
+[vocab] size=65 max_len=128 max_seen_len=70 oversized@50k=0
+[vocab] saved → /root/mol_struct_ae/runs/vocab.json
+[DistillBackend] ckpt step=36748 hidden=256 layers=6 output_dim=256  val_cos_loss(best)=0.03689250063399474
+
+[BBBP] downloading + parsing …
+[download] https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/BBBP.csv
+[BBBP] 2050 mols, 1 task(s); protocol: split=scaffold metric=auroc
+[BBBP] kept 2050/2050 after prepare
+[BBBP] 80/10/10 (scaffold, seed=0) → train=1640 val=205 test=205
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[BBBP] seed=0 test=0.9576
+[BBBP] 80/10/10 (scaffold, seed=1) → train=1640 val=205 test=205
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[BBBP] seed=1 test=0.8667
+[BBBP] 80/10/10 (scaffold, seed=2) → train=1640 val=205 test=205
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[BBBP] seed=2 test=0.9380
+[BBBP] AUROC = 0.9208 ± 0.0391 over 3 seeds  (412s)
+
+[BACE] downloading + parsing …
+[download] https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/bace.csv
+[BACE] 1513 mols, 1 task(s); protocol: split=scaffold metric=auroc
+[BACE] kept 1513/1513 after prepare
+[BACE] 80/10/10 (scaffold, seed=0) → train=1210 val=151 test=152
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[BACE] seed=0 test=0.7992
+[BACE] 80/10/10 (scaffold, seed=1) → train=1210 val=151 test=152
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[BACE] seed=1 test=0.8493
+[BACE] 80/10/10 (scaffold, seed=2) → train=1210 val=151 test=152
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[BACE] seed=2 test=0.7943
+[BACE] AUROC = 0.8143 ± 0.0249 over 3 seeds  (308s)
+
+[HIV] downloading + parsing …
+[download] https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/HIV.csv
+[HIV] 41127 mols, 1 task(s); protocol: split=scaffold metric=auroc
+[HIV] kept 41127/41127 after prepare
+[HIV] 80/10/10 (scaffold, seed=0) → train=32901 val=4112 test=4114
+/usr/local/lib/python3.11/site-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[modal-client] 2026-06-01T17:11:42+0000 Received a cancellation signal while processing input ('in-01KT21VBXPR8048PPGJHH4JPS0:1780332998582-0',)
+[modal-client] 2026-06-01T17:11:42+0000 Successfully canceled input ('in-01KT21VBXPR8048PPGJHH4JPS0:1780332998582-0',)
+╭───────────────────── Traceback (most recent call last) ──────────────────────╮
+│ /Users/eding36/VSCodeProjects/mol_struct_ae/modal_distillation.py:281 in     │
+│ moleculenet_finetune_distill                                                 │
+│                                                                              │
+│   280 │   seed_list = [int(s) for s in seeds.split(",") if s.strip()]        │
+│ ❱ 281 │   print(f"[moleculenet_finetune_distill] ckpt={distill_ckpt}")       │
+│   282 │   print(f"  vocab={vocab_path}   datasets={ds_list}   seeds={seed_li │
+│                                                                              │
+│ /Users/eding36/VSCodeProjects/.venv/lib/python3.12/site-packages/modal/_obje │
+│ ct.py:46 in wrapped                                                          │
+│                                                                              │
+│    45 │   │   await self.hydrate()                                           │
+│ ❱  46 │   │   return await method(self, *args, **kwargs)                     │
+│    47                                                                        │
+│                                                                              │
+│ /Users/eding36/VSCodeProjects/.venv/lib/python3.12/site-packages/modal/_func │
+│ tions.py:1696 in remote                                                      │
+│                                                                              │
+│   1695 │   │                                                                 │
+│ ❱ 1696 │   │   return await self._call_function(args, kwargs)                │
+│   1697                                                                       │
+│                                                                              │
+│ /Users/eding36/VSCodeProjects/.venv/lib/python3.12/site-packages/modal/_func │
+│ tions.py:1640 in _call_function                                              │
+│                                                                              │
+│   1639 │   │                                                                 │
+│ ❱ 1640 │   │   return await invocation.run_function()                        │
+│   1641                                                                       │
+│                                                                              │
+│ /Users/eding36/VSCodeProjects/.venv/lib/python3.12/site-packages/modal/_func │
+│ tions.py:474 in run_function                                                 │
+│                                                                              │
+│    473 │   │   │   if await_response.output.result.status in TERMINAL_STATUS │
+│ ❱  474 │   │   │   │   return await _process_result(                         │
+│    475 │   │   │   │   │   await_response.output.result, await_response.outp │
+│                                                                              │
+│ /Users/eding36/VSCodeProjects/.venv/lib/python3.12/site-packages/modal/_util │
+│ s/function_utils.py:550 in _process_result                                   │
+│                                                                              │
+│   549 │   │                                                                  │
+│ ❱ 550 │   │   raise RemoteError(result.exception)                            │
+│   551                                                                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+RemoteError: Function call was cancelled by user or a failure.
