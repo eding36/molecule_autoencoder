@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
 """
-Distillation pipeline on Modal:
-  1. precompute_mol_struct_ae_embeds_modal — run the trained MolStructAutoencoder
-     over the shards on the volume, dump (smiles, sim_embed) pairs.
-  2. train_distillation_modal           — train the SmilesEncoder distillation to match.
+Distillation pipeline on Modal.
 
-Both run on a single A10G. Total job time ≈ 30 min on ~43k molecules.
+Three-step parallel pipeline:
+  1. `precompute_partition_modal` — spawned N× in parallel; each handles every
+     Nth shard with bf16 autocast inference, writes its own partition file.
+  2. `merge_pairs_modal`         — CPU-only, concatenates the N partitions
+     into one (smiles, sim_embed) pairs file.
+  3. `train_distill_modal`       — trains the SmilesEncoder via cosine
+     distillation against the merged targets.
 
-Run end-to-end:
-    MODAL_PROFILE=<profile> python -m modal run --detach modal_distillation.py
+Entrypoint: `main_parallel` orchestrates all three. `resume_merge_and_train`
+skips Stage 1 if partitions already exist on the volume.
 
-Download distillation checkpoint when done:
+Download the trained checkpoint when done:
     MODAL_PROFILE=<profile> python -m modal run \\
         modal_distillation.py::download_results
 """
 from __future__ import annotations
-
-from pathlib import Path
 
 import modal
 
 APP_NAME = "molstructae-distill"
 REMOTE_DIR = "/root/mol_struct_ae"
 RUNS_DIR = "/root/runs"
-CKPT_DIR = f"{RUNS_DIR}/zinc250k"
 PAIRS_OUT = f"{RUNS_DIR}/mol_struct_ae_embeds.pt"
 DISTILLATION_DIR = f"{RUNS_DIR}/distill"
 LOCAL_PROJECT = "/Users/eding36/VSCodeProjects/mol_struct_ae"
-LOCAL_CKPT = f"{LOCAL_PROJECT}/runs/zinc250k_remote/ckpt_step002000.pt"
-LOCAL_VOCAB = f"{LOCAL_PROJECT}/runs/vocab.json"
 
 app = modal.App(APP_NAME)
 
@@ -51,96 +49,253 @@ image = (
 runs_vol = modal.Volume.from_name("molstructae-runs", create_if_missing=True)
 
 
+# ── Per-partition precompute: 1 GPU container handles shard_paths[start::stride]
 @app.function(
     image=image, gpu="A10G", cpu=4.0, memory=16 * 1024,
-    timeout=60 * 60 * 3,
+    timeout=60 * 60 * 24,
     volumes={RUNS_DIR: runs_vol},
 )
-def pipeline_modal(
-    ckpt_name: str = "ckpt_step002000.pt",
-    epochs: int = 20,
-    batch_size: int = 256,
-    hidden: int = 256,
-    num_layers: int = 6,
-    num_heads: int = 8,
-    lr: float = 3e-4,
-) -> None:
-    import os
-    import subprocess
-    import sys
-
-    ckpt_path = f"{CKPT_DIR}/{ckpt_name}"
-    vocab_path = f"{REMOTE_DIR}/runs/vocab.json"           # uploaded with add_local_dir
-    if not os.path.exists(vocab_path):
-        # Fallback: build it on the fly from the bundled CSV.
-        print(f"[pipeline] vocab not found at {vocab_path}; building from CSV")
-        subprocess.run([
-            sys.executable, "-u", f"{REMOTE_DIR}/scripts/build_vocab.py",
-            "--csv", f"{REMOTE_DIR}/data/zinc250k.csv",
-            "--out", vocab_path,
-        ], check=True, cwd=REMOTE_DIR)
-
-    # ---- Stage 1: precompute mol_struct_ae embeds from shards on the volume
-    print(f"[pipeline] STAGE 1: precompute mol_struct_ae embeddings")
-    subprocess.run([
+def precompute_partition_modal(
+    ckpt_path: str, shard_dir: str, partition_out: str,
+    shard_start: int, shard_stride: int, batch_size: int = 256, amp: bool = True,
+) -> str:
+    """Run precompute on a subset of shards (every Nth, offset by start)."""
+    import subprocess, sys
+    cmd = [
         sys.executable, "-u", f"{REMOTE_DIR}/scripts/precompute_mol_struct_ae_embeds.py",
         "--checkpoint", ckpt_path,
-        "--shard-dir", f"{RUNS_DIR}/shards",
-        "--out", PAIRS_OUT,
-        "--batch-size", "128",
-    ], check=True, cwd=REMOTE_DIR)
+        "--shard-dir", shard_dir,
+        "--out", partition_out,
+        "--batch-size", str(batch_size),
+        "--shard-start", str(shard_start),
+        "--shard-stride", str(shard_stride),
+    ]
+    if amp:
+        cmd.append("--amp")
+    print(f"[partition {shard_start}/{shard_stride}] running: {' '.join(cmd)}", flush=True)
+    subprocess.run(cmd, check=True, cwd=REMOTE_DIR)
     runs_vol.commit()
+    return partition_out
 
-    # ---- Stage 2: train the distillation
-    print(f"\n[pipeline] STAGE 2: train SMILES-only distillation")
+
+# ── Merge per-partition outputs into a single pairs file (CPU only)
+@app.function(
+    image=image, cpu=4.0, memory=16 * 1024,
+    timeout=60 * 30, volumes={RUNS_DIR: runs_vol},
+)
+def merge_pairs_modal(partition_paths: list, merged_out: str) -> str:
+    import numpy as np, torch
+    smiles_all, embeds_all = [], []
+    runs_vol.reload()
+    for p in partition_paths:
+        d = torch.load(p, map_location="cpu", weights_only=False)
+        smiles_all.extend(d["smiles"])
+        embeds_all.append(d["embeds"])
+        print(f"[merge] loaded {p}: {len(d['smiles'])} pairs")
+    embeds = np.concatenate(embeds_all, axis=0)
+    print(f"[merge] writing {len(smiles_all)} pairs → {merged_out}")
+    torch.save({"smiles": smiles_all, "embeds": embeds}, merged_out, pickle_protocol=4)
+    runs_vol.commit()
+    return merged_out
+
+
+# ── Stage 2: train the SmilesEncoder via cosine distillation
+@app.function(
+    image=image, gpu="A10G", cpu=4.0, memory=16 * 1024,
+    timeout=60 * 60 * 12,
+    volumes={RUNS_DIR: runs_vol},
+)
+def train_distill_modal(
+    pairs_path: str, epochs: int = 20, batch_size: int = 256,
+    hidden: int = 256, num_layers: int = 6, num_heads: int = 8, lr: float = 3e-4,
+) -> None:
+    import os, subprocess, sys
+    vocab_path = f"{REMOTE_DIR}/runs/vocab.json"
+    if not os.path.exists(vocab_path):
+        subprocess.run([
+            sys.executable, "-u", f"{REMOTE_DIR}/scripts/build_vocab.py",
+            "--csv", f"{REMOTE_DIR}/data/zinc250k.csv", "--out", vocab_path,
+        ], check=True, cwd=REMOTE_DIR)
     os.makedirs(DISTILLATION_DIR, exist_ok=True)
     subprocess.run([
         sys.executable, "-u", f"{REMOTE_DIR}/train_distillation.py",
-        "--pairs", PAIRS_OUT,
-        "--vocab", vocab_path,
+        "--pairs", pairs_path, "--vocab", vocab_path,
         "--out-dir", DISTILLATION_DIR,
-        "--epochs", str(epochs),
-        "--batch-size", str(batch_size),
-        "--hidden", str(hidden),
-        "--num-layers", str(num_layers),
-        "--num-heads", str(num_heads),
-        "--lr", str(lr),
+        "--epochs", str(epochs), "--batch-size", str(batch_size),
+        "--hidden", str(hidden), "--num-layers", str(num_layers),
+        "--num-heads", str(num_heads), "--lr", str(lr),
     ], check=True, cwd=REMOTE_DIR)
     runs_vol.commit()
 
 
-def _upload_if_missing(local_path: str, remote_rel: str) -> None:
-    """Idempotently upload a local file to the volume."""
-    p = Path(local_path)
-    if not p.is_file():
-        raise FileNotFoundError(f"local file not found: {local_path}")
-    print(f"[upload] {p.name} → volume:{remote_rel}")
-    with runs_vol.batch_upload(force=True) as upload:
-        upload.put_file(str(p), remote_rel)
+@app.local_entrypoint()
+def main_parallel(
+    ckpt_path: str = "",                       # absolute path on volume
+    shard_dir: str = "",                       # absolute shard dir on volume
+    pairs_out: str = "",                       # absolute output path for merged pairs
+    n_partitions: int = 4,                     # parallel precompute workers
+    epochs: int = 20, batch_size: int = 256,
+    hidden: int = 256, num_layers: int = 6, lr: float = 3e-4,
+):
+    """Parallel distillation pipeline.
+
+    Stage 1: spawn `n_partitions` A10G containers, each handles every Nth
+    shard with AMP/bf16 inference (~4× wall-time win on Stage 1).
+    Stage 2: merge per-partition outputs on CPU, then train distillation on
+    one A10G container.
+
+    Total wall-time: roughly Stage1/N + Stage2 (≈ 1.5h + 5h ≈ 6.5h for 5M
+    pairs at N=4, vs ~15h for the serial pipeline).
+    """
+    if not ckpt_path:
+        raise SystemExit("--ckpt-path required for main_parallel")
+    if not shard_dir:
+        raise SystemExit("--shard-dir required for main_parallel")
+    pairs_out = pairs_out or PAIRS_OUT
+
+    # Per-partition output paths (in same dir as merged output)
+    base, ext = (pairs_out.rsplit(".", 1) + ["pt"])[:2]
+    partition_paths = [f"{base}_part{i}of{n_partitions}.{ext}"
+                        for i in range(n_partitions)]
+
+    print(f"[main_parallel] {n_partitions}-way parallel precompute")
+    print(f"  ckpt   : {ckpt_path}")
+    print(f"  shards : {shard_dir}")
+    print(f"  merged : {pairs_out}")
+
+    # Stage 1 — spawn N parallel partitions, collect outputs.
+    futures = [
+        precompute_partition_modal.spawn(
+            ckpt_path=ckpt_path, shard_dir=shard_dir,
+            partition_out=partition_paths[i],
+            shard_start=i, shard_stride=n_partitions,
+            batch_size=batch_size, amp=True,
+        )
+        for i in range(n_partitions)
+    ]
+    print(f"[main_parallel] spawned {n_partitions} precompute partitions; waiting…")
+    for i, f in enumerate(futures):
+        print(f"  partition {i}: done → {f.get()}")
+
+    # Stage 1.5 — merge.
+    print(f"[main_parallel] merging partitions → {pairs_out}")
+    merge_pairs_modal.remote(partition_paths=partition_paths, merged_out=pairs_out)
+
+    # Stage 2 — train.
+    print(f"[main_parallel] launching Stage 2 (train_distill)")
+    train_distill_modal.spawn(
+        pairs_path=pairs_out, epochs=epochs, batch_size=batch_size,
+        hidden=hidden, num_layers=num_layers, lr=lr,
+    )
 
 
 @app.local_entrypoint()
-def main(
-    epochs: int = 20,
-    batch_size: int = 256,
-    hidden: int = 256,
-    num_layers: int = 6,
-    lr: float = 3e-4,
+def resume_merge_and_train(
+    pairs_out: str = "",
+    n_partitions: int = 4,
+    epochs: int = 20, batch_size: int = 256,
+    hidden: int = 256, num_layers: int = 6, lr: float = 3e-4,
 ):
-    """Upload mol_struct_ae checkpoint to the volume (if local copy exists), then
-    spawn the GPU pipeline."""
-    if Path(LOCAL_CKPT).is_file():
-        _upload_if_missing(LOCAL_CKPT, "zinc250k/ckpt_step002000.pt")
-    else:
-        print(f"[main] WARN local ckpt not at {LOCAL_CKPT}; expecting it on volume already")
-
-    print("Launching distillation pipeline on Modal (A10G GPU)")
-    print(f"  Stage 1: precompute mol_struct_ae embeds from /root/runs/shards/")
-    print(f"  Stage 2: train SmilesEncoder ({num_layers}L × {hidden}d) for {epochs}ep")
-    pipeline_modal.spawn(
-        epochs=epochs, batch_size=batch_size, hidden=hidden,
-        num_layers=num_layers, lr=lr,
+    """Resume: skip Stage 1 (assumes partition files already on volume), run
+    merge + Stage 2 training. Use when a previous main_parallel run completed
+    Stage 1 partitions but the merge or Stage 2 failed.
+    """
+    pairs_out = pairs_out or PAIRS_OUT
+    base, ext = (pairs_out.rsplit(".", 1) + ["pt"])[:2]
+    partition_paths = [f"{base}_part{i}of{n_partitions}.{ext}"
+                        for i in range(n_partitions)]
+    print(f"[resume] merging {n_partitions} partitions → {pairs_out}")
+    merge_pairs_modal.remote(partition_paths=partition_paths, merged_out=pairs_out)
+    print(f"[resume] launching Stage 2 (train_distill)")
+    train_distill_modal.spawn(
+        pairs_path=pairs_out, epochs=epochs, batch_size=batch_size,
+        hidden=hidden, num_layers=num_layers, lr=lr,
     )
+
+
+# ── MoleculeNet fine-tuning on the distillation SmilesEncoder
+@app.function(
+    image=image, gpu="A10G", cpu=4.0, memory=16 * 1024,
+    timeout=60 * 60 * 6,
+    volumes={RUNS_DIR: runs_vol},
+)
+def moleculenet_finetune_distill_modal(
+    distill_ckpt: str, vocab_path: str, datasets: list, seeds: list,
+    epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
+    dropout: float = 0.5, train_smiles_path: str = "",
+    split_strategy: str = "deterministic",
+) -> list:
+    import os, sys, subprocess
+    sys.path.insert(0, REMOTE_DIR)
+    from utils.benchmark_moleculenet import DistillBackend, run_finetune_benchmark
+
+    # Vocab fallback: `runs/` is excluded from the image mount, so we rebuild
+    # from the bundled CSV if the file is missing on the container fs.
+    if not os.path.exists(vocab_path):
+        print(f"[ft-distill] vocab not found at {vocab_path}; building from CSV")
+        os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
+        subprocess.run([
+            sys.executable, "-u", f"{REMOTE_DIR}/scripts/build_vocab.py",
+            "--csv", f"{REMOTE_DIR}/data/zinc250k.csv", "--out", vocab_path,
+        ], check=True, cwd=REMOTE_DIR)
+
+    backend = DistillBackend(distill_ckpt, vocab_path)
+    return run_finetune_benchmark(
+        backend, datasets=datasets, seeds=seeds, epochs=epochs,
+        batch_size=batch_size, lr=lr, dropout=dropout,
+        train_smiles_path=train_smiles_path or None,
+        split_strategy=split_strategy,
+    )
+
+
+# Mole-BERT Table 1 reference numbers — same as in modal_mol_struct_ae.py.
+MOLEBERT_REFERENCE = {
+    "Tox21": 0.768, "ToxCast": 0.643, "SIDER": 0.628, "ClinTox": 0.789,
+    "MUV": 0.786, "HIV": 0.782, "BBBP": 0.719, "BACE": 0.808,
+}
+
+
+@app.local_entrypoint()
+def moleculenet_finetune_distill(
+    distill_ckpt: str = f"{DISTILLATION_DIR}/best.pt",
+    vocab_path: str = f"{REMOTE_DIR}/runs/vocab.json",
+    datasets: str = "BBBP,BACE,SIDER,Tox21",
+    seeds: str = "0,1,2",
+    epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
+    train_smiles_path: str = "",
+    split_strategy: str = "deterministic",
+):
+    """Fine-tune the SMILES-only distillation encoder on MoleculeNet.
+
+    Identical protocol to `modal_mol_struct_ae.py::moleculenet_finetune` (Hu
+    et al. / Mole-BERT: scaffold 80/10/10, end-to-end fine-tuning, best-val
+    epoch, mean±std). But uses the distillation `SmilesEncoder` as backbone —
+    no RDKit featurization needed, ~100× faster per molecule on the forward
+    pass. Same fine-tuning protocol = directly comparable AUROCs.
+    """
+    ds_list = [d.strip() for d in datasets.split(",") if d.strip()]
+    seed_list = [int(s) for s in seeds.split(",") if s.strip()]
+    print(f"[moleculenet_finetune_distill] ckpt={distill_ckpt}")
+    print(f"  vocab={vocab_path}   datasets={ds_list}   seeds={seed_list}")
+    print(f"  split_strategy={split_strategy}")
+    res = moleculenet_finetune_distill_modal.remote(
+        distill_ckpt=distill_ckpt, vocab_path=vocab_path,
+        datasets=ds_list, seeds=seed_list,
+        epochs=epochs, batch_size=batch_size, lr=lr,
+        train_smiles_path=train_smiles_path,
+        split_strategy=split_strategy,
+    )
+    print("\n" + "=" * 78)
+    print("  MoleculeNet — DISTILL SmilesEncoder END-TO-END FINE-TUNING")
+    print("  (same protocol as the AE benchmark; no RDKit featurization)")
+    print("=" * 78)
+    print(f"  {'Dataset':<10}  {'Metric':<6}  {'N':>6}  {'OURS (mean±std)':>20}  {'Mole-BERT':>9}")
+    for r in res:
+        ref = MOLEBERT_REFERENCE.get(r["dataset"])
+        ref_s = f"{ref:.3f}" if ref else "  —  "
+        print(f"  {r['dataset']:<10}  {r['metric']:<6}  {r['n_kept']:>6}  "
+               f"{r['mean']:.4f} ± {r['std']:.4f}  {ref_s:>9}")
+    return res
 
 
 @app.local_entrypoint()

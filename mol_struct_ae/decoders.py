@@ -123,13 +123,7 @@ class Geometry3DDecoder(nn.Module):
 
 
 class ChargeDecoder(nn.Module):
-    """Reconstructs per-atom partial charges from atom slot features.
-
-    A voxel-grid deconv path was considered and removed: PCA-canonicalized
-    grids are not consistently oriented across structurally similar molecules,
-    so the grid introduced noisy training signal. Per-atom charges are SE(3)-
-    invariant by construction.
-    """
+    """Reconstructs per-atom partial charges from atom slot features."""
 
     def __init__(self, hidden_dim: int):
         super().__init__()

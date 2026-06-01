@@ -1,19 +1,16 @@
 """
 Pairformer-lite for molecular structure autoencoding.
 
-Replaces the 5-separate-encoder + post-hoc cross-attention design with a
-unified backbone modelled on AlphaFold-3's Pairformer (and RoseTTAFold-3's
-analogous stack). Two representations:
+Unified backbone modelled on AlphaFold-3's Pairformer. Two representations:
 
     single_repr  [B, N, d_single]   - per-atom features
     pair_repr    [B, N, N, d_pair]  - per-(atom, atom) features
 
-Every input track (2D atom features, atom types, partial charges, pharma flags,
-torsion-derived per-atom features) gets *added into* `single_repr` at the
-input embedder; every per-pair input (adjacency, bond features, bond lengths)
-gets added into `pair_repr`. The 5 tracks are no longer separate computations
-— they share a unified backbone that updates `single` and `pair` jointly at
-every block.
+Per-atom inputs (atom features, atom types, partial charges, pharma flags) are
+summed into `single_repr` at the input embedder; per-pair inputs (adjacency,
+bond features, bond lengths, bond angles, dihedrals) are summed into
+`pair_repr`. From that point on, every block updates the two representations
+jointly:
 
 A `PairformerBlock` does, at each layer:
     1. pair += OuterProductMean(single)              # single contributes to pair
@@ -24,8 +21,7 @@ A `PairformerBlock` does, at each layer:
 
 This is the "Pairformer-lite" — drops AF3's triangle multiplication and
 ending-node triangle attention (we keep only starting-node triangle attention)
-to fit in our compute budget at N=96. The remaining operations are sufficient
-to propagate information across all 5 tracks at every layer.
+to fit in our compute budget at N=96.
 """
 from __future__ import annotations
 
@@ -439,17 +435,12 @@ class GlobalAggregator(nn.Module):
       • A CLS-like vector → μ, log σ²  → z (the latent)
       • K context tokens that the decoders consume as cross-attention memory
 
-    Implementation note: K + 1 learned queries share one MultiheadAttention.
-    Query index 0 is the CLS query (drives the latent); queries 1…K are the
-    context tokens (decoder memory). This matches the 5-track architecture's
-    pattern where the latent came from a CLS-token attending over the
-    pooled track tokens — the discrimination came from learned attention
-    weights, not arithmetic mean.
-
-    Previous design used arithmetic masked-mean over per-atom features for
-    the latent. That averaged out molecular distinctions: aspirin and
-    glucose (similar atom-feature distributions) ended up with similar
-    means → very high cosine similarity → poor downstream discrimination.
+    Implementation: K + 1 learned queries share one MultiheadAttention call.
+    Query index 0 is the CLS query (its attention output drives the latent);
+    queries 1…K are the context tokens (decoder cross-attention memory).
+    Learned attention weights from the CLS query give the latent room to be
+    discriminative — much more so than a plain masked-mean of per-atom
+    features, which collapses distinct drug-like molecules onto similar means.
     """
 
     def __init__(

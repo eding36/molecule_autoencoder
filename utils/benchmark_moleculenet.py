@@ -223,32 +223,124 @@ def scaffold_split_3way(smiles: List[str], frac_train: float = 0.8,
     return train, val, test
 
 
+def random_scaffold_split_3way(
+    smiles: List[str], seed: int,
+    frac_train: float = 0.8, frac_val: float = 0.1,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Scaffold-disjoint split with per-seed-randomized group order.
+
+    Same scaffold disjointness as `scaffold_split_3way` (no scaffold appears in
+    two splits), but the order in which scaffold groups are assigned to
+    train/val/test is shuffled with `seed`. Different seeds produce different
+    splits, so positives/negatives naturally distribute across train/val/test
+    across the seed range — fixes the extreme-imbalance pathology that the
+    deterministic largest-first variant exhibits on ClinTox.
+
+    This matches DeepChem's `RandomGroupSplitter` behavior, which appears to be
+    Mole-BERT's actual MoleculeNet split (their ClinTox = 0.789 is incompatible
+    with deterministic largest-first under the natural label distribution).
+    """
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for i, s in enumerate(smiles):
+        groups[_murcko(s)].append(i)
+    group_list = list(groups.values())
+    rng = np.random.default_rng(seed)
+    rng.shuffle(group_list)
+
+    n = len(smiles)
+    n_train, n_val = int(frac_train * n), int(frac_val * n)
+    train, val, test = [], [], []
+    for g in group_list:
+        if len(train) + len(g) <= n_train:
+            train.extend(g)
+        elif len(val) + len(g) <= n_val:
+            val.extend(g)
+        else:
+            test.extend(g)
+    return train, val, test
+
+
+def stratified_scaffold_split_3way(
+    smiles: List[str], Y: np.ndarray,
+    frac_train: float = 0.8, frac_val: float = 0.1,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Scaffold-disjoint split that additionally ensures each binary task has
+    both classes present in val and test (when feasible).
+
+    Starts from the deterministic largest-first scaffold split, then for each
+    task checks val/test class diversity; if a split is missing a class, moves
+    the smallest train scaffold group containing the missing class into that
+    split. No-op for datasets whose splits already have class diversity (e.g.
+    BBBP, BACE, Tox21) — preserves prior results bit-for-bit when no swap is
+    needed. Designed for ClinTox-style extreme class imbalance.
+    """
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for i, s in enumerate(smiles):
+        groups[_murcko(s)].append(i)
+    sorted_groups = sorted(groups.values(), key=lambda g: (-len(g), smiles[g[0]]))
+
+    n = len(smiles)
+    n_train, n_val = int(frac_train * n), int(frac_val * n)
+    train, val, test = [], [], []
+    train_groups: List[List[int]] = []
+    val_groups:   List[List[int]] = []
+    test_groups:  List[List[int]] = []
+    for g in sorted_groups:
+        if len(train) + len(g) <= n_train:
+            train.extend(g); train_groups.append(g)
+        elif len(val) + len(g) <= n_val:
+            val.extend(g); val_groups.append(g)
+        else:
+            test.extend(g); test_groups.append(g)
+
+    Y = np.asarray(Y)
+    n_tasks = Y.shape[1] if Y.ndim == 2 else 1
+
+    def _has_both_classes(idx_list, t):
+        yt = Y[idx_list, t]
+        yt = yt[~np.isnan(yt)]
+        if len(yt) == 0:
+            return True  # no labels — nothing to stratify
+        return len(np.unique(yt)) >= 2
+
+    def _smallest_train_group_with(t, target_class):
+        best, best_size = None, float("inf")
+        for tg in train_groups:
+            yt = Y[tg, t]
+            yt = yt[~np.isnan(yt)]
+            if (yt == target_class).any() and len(tg) < best_size:
+                best, best_size = tg, len(tg)
+        return best
+
+    swaps = 0
+    for t in range(n_tasks):
+        for split_idx, split_groups in ((val, val_groups), (test, test_groups)):
+            if _has_both_classes(split_idx, t):
+                continue
+            yt = Y[split_idx, t]
+            yt = yt[~np.isnan(yt)]
+            present = int(yt[0]) if len(yt) > 0 else 1
+            missing = 1 - present
+            donor = _smallest_train_group_with(t, missing)
+            if donor is None:
+                continue
+            for idx in donor:
+                train.remove(idx)
+                split_idx.append(idx)
+            train_groups.remove(donor)
+            split_groups.append(donor)
+            swaps += 1
+
+    if swaps:
+        print(f"[stratify] moved {swaps} scaffold group(s) from train to "
+               f"val/test to ensure class diversity")
+
+    return train, val, test
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Fine-tune model: pretrained encoder (encode→mu) + a dropout+linear task head.
-# All encoder params + head params are optimized end-to-end.
+# Shared loss + eval — backend-agnostic.
 # ──────────────────────────────────────────────────────────────────────────────
-class FineTuneModel(nn.Module):
-    def __init__(self, ae: nn.Module, latent_dim: int, n_tasks: int,
-                 dropout: float = 0.5):
-        super().__init__()
-        self.ae = ae
-        self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(latent_dim, n_tasks)
-
-    def forward(self, batch) -> torch.Tensor:
-        enc = self.ae.encode(batch, sample=False)     # uses mu (deterministic)
-        h = self.dropout(enc["mu"])
-        return self.head(h)                            # [B, n_tasks]
-
-    def trainable_parameters(self):
-        # Encoder path that actually contributes to encode(): input embedder,
-        # pairformer stack, global aggregator. Decoders are excluded (no grad).
-        for mod in (self.ae.input_embedder, self.ae.pairformer, self.ae.aggregator):
-            yield from mod.parameters()
-        yield from self.dropout.parameters()
-        yield from self.head.parameters()
-
-
 def _multitask_bce(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Masked BCE over non-NaN labels. logits/y: [B, T]."""
     mask = ~torch.isnan(y)
@@ -260,49 +352,185 @@ def _multitask_bce(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _evaluate(model: FineTuneModel, samples, Y, idx, collate_fn, device,
-              task: str, max_atoms: int, batch_size: int = 128) -> float:
+def _evaluate(model: nn.Module, prepared, Y: np.ndarray, idx, task: str,
+              batch_size: int = 128) -> Tuple[float, float]:
+    """Returns (primary_metric, val_loss). primary_metric is ROC-AUC (cls) or
+    RMSE (reg). val_loss is masked BCE (cls) or MSE (reg) — always defined,
+    used as fallback selection when ROC-AUC is undefined on a degenerate
+    (single-class) val split. `model(prepared, indices)` must return logits.
+    """
     model.eval()
     preds: List[np.ndarray] = []
     for i in range(0, len(idx), batch_size):
-        chunk = [samples[j] for j in idx[i:i + batch_size]]
-        batch = collate_fn(chunk).to(device)
-        out = model(batch).cpu().numpy()
-        preds.append(out)
+        bidx = idx[i:i + batch_size]
+        logits = model(prepared, bidx).cpu().numpy()
+        preds.append(logits)
     P = np.concatenate(preds, axis=0) if preds else np.zeros((0, Y.shape[1]))
     Yt = Y[idx]
     if task == "regression":
-        # single-task regression in practice
-        return float(np.sqrt(mean_squared_error(Yt[:, 0], P[:, 0])))
-    # classification: mean ROC-AUC over tasks that have both classes in this split
+        rmse = float(np.sqrt(mean_squared_error(Yt[:, 0], P[:, 0])))
+        return rmse, rmse
+    mask = ~np.isnan(Yt)
+    y_safe = np.nan_to_num(Yt, nan=0.0)
+    z = P
+    bce = np.maximum(z, 0) - z * y_safe + np.log1p(np.exp(-np.abs(z)))
+    loss = float((bce * mask).sum() / max(mask.sum(), 1))
     aucs: List[float] = []
     for t in range(Y.shape[1]):
-        yt = Yt[:, t]
-        m = ~np.isnan(yt)
+        yt = Yt[:, t]; m = ~np.isnan(yt)
         if m.sum() == 0 or len(np.unique(yt[m])) < 2:
             continue
         aucs.append(roc_auc_score(yt[m], P[m, t]))
-    return float(np.mean(aucs)) if aucs else float("nan")
+    auc = float(np.mean(aucs)) if aucs else float("nan")
+    return auc, loss
 
 
-def finetune_once(make_ae: Callable[[], nn.Module], latent_dim: int,
-                  samples, Y, splits, task: str, collate_fn, device,
-                  max_atoms: int, seed: int, epochs: int = 100,
-                  batch_size: int = 32, lr: float = 1e-3,
+# ──────────────────────────────────────────────────────────────────────────────
+# Backends — each handles its own data prep + model construction. The driver
+# is generic: it calls `backend.prepare(smiles, device)` once per dataset and
+# `backend.build_finetune_model(n_tasks)` once per seed. Models built by a
+# backend must implement `forward(prepared, indices) -> logits` so the train
+# loop is data-shape-agnostic.
+# ──────────────────────────────────────────────────────────────────────────────
+class _AEFinetuneWrapper(nn.Module):
+    """Pairformer encoder + dropout + linear task head, end-to-end trainable."""
+    def __init__(self, ae: nn.Module, latent_dim: int, n_tasks: int,
+                 dropout: float, collate_fn: Callable):
+        super().__init__()
+        self.ae = ae
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(latent_dim, n_tasks)
+        self.collate_fn = collate_fn
+
+    def forward(self, prepared, indices):
+        chunk = [prepared["samples"][i] for i in indices]
+        batch = self.collate_fn(chunk).to(prepared["device"])
+        mu = self.ae.encode(batch, sample=False)["mu"]
+        return self.head(self.dropout(mu))
+
+    def trainable_parameters(self):
+        # Encoder path only — decoders are not in the forward graph but live
+        # in `ae.parameters()`; excluding them avoids spurious weight decay.
+        for mod in (self.ae.input_embedder, self.ae.pairformer, self.ae.aggregator):
+            yield from mod.parameters()
+        yield from self.dropout.parameters()
+        yield from self.head.parameters()
+
+
+class _DistillFinetuneWrapper(nn.Module):
+    """SmilesEncoder + dropout + linear task head, end-to-end trainable."""
+    def __init__(self, encoder: nn.Module, output_dim: int, n_tasks: int,
+                 dropout: float):
+        super().__init__()
+        self.encoder = encoder
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(output_dim, n_tasks)
+
+    def forward(self, prepared, indices):
+        ids = prepared["ids"][indices]
+        mask = prepared["mask"][indices]
+        h = self.encoder(ids, mask, normalize=False)
+        return self.head(self.dropout(h))
+
+
+class AEBackend:
+    """Pairformer mol_struct_ae fine-tune backend (RDKit ETKDG featurization)."""
+    def __init__(self, checkpoint_path: str):
+        import torch as _torch
+        from mol_struct_ae import MolStructAutoencoder
+        from mol_struct_ae.model import MolAEConfig
+        from mol_struct_ae.dataset import make_collate_fn
+        ckpt = _torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        cfg_args = ckpt.get("config", {})
+        self.cfg = MolAEConfig(
+            max_atoms=cfg_args.get("max_atoms", 96),
+            hidden_dim=cfg_args.get("hidden", 128),
+            latent_dim=cfg_args.get("latent", 256),
+        )
+        self.state = ckpt["model"]
+        self.collate_fn = make_collate_fn(self.cfg.max_atoms,
+                                           cfg_args.get("max_dihedrals", 64))
+        self._MolStructAutoencoder = MolStructAutoencoder
+        print(f"[AEBackend] ckpt step={ckpt.get('step', '?')} "
+               f"max_atoms={self.cfg.max_atoms} hidden={self.cfg.hidden_dim} "
+               f"latent={self.cfg.latent_dim}")
+
+    def prepare(self, smiles: List[str], device: torch.device
+                ) -> Tuple[List[int], dict]:
+        """ETKDG-featurize each SMILES; return (kept_indices, opaque_state)."""
+        from utils.featurize import featurize_smiles
+        samples, keep = [], []
+        for i, smi in enumerate(smiles):
+            s = featurize_smiles(smi, max_atoms=self.cfg.max_atoms)
+            if s is None:
+                continue
+            samples.append(s); keep.append(i)
+        return keep, {"samples": samples, "device": device}
+
+    def build_finetune_model(self, n_tasks: int, dropout: float = 0.5) -> nn.Module:
+        ae = self._MolStructAutoencoder(self.cfg)
+        ae.load_state_dict(self.state)
+        return _AEFinetuneWrapper(ae, self.cfg.latent_dim, n_tasks, dropout,
+                                   self.collate_fn)
+
+
+class DistillBackend:
+    """SMILES-only distillation fine-tune backend (no featurization)."""
+    def __init__(self, checkpoint_path: str, vocab_path: str):
+        import torch as _torch
+        from distillation.smiles_encoder import SmilesEncoder, SmilesEncoderConfig
+        from distillation.smiles_tokenizer import SmilesTokenizer
+        ckpt = _torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self.cfg = SmilesEncoderConfig(**ckpt["encoder_config"])
+        self.state = ckpt["model"]
+        self.tok = SmilesTokenizer.load(vocab_path)
+        if self.tok.max_len != self.cfg.max_len:
+            self.tok = SmilesTokenizer(self.tok.vocab, max_len=self.cfg.max_len)
+        self._SmilesEncoder = SmilesEncoder
+        print(f"[DistillBackend] ckpt step={ckpt.get('step', '?')} "
+               f"hidden={self.cfg.hidden_dim} layers={self.cfg.num_layers} "
+               f"output_dim={self.cfg.output_dim}  val_cos_loss(best)="
+               f"{ckpt.get('val_loss', '?')}")
+
+    def prepare(self, smiles: List[str], device: torch.device
+                ) -> Tuple[List[int], dict]:
+        """Tokenize all SMILES once; reuse across all seeds."""
+        keep = [i for i, s in enumerate(smiles) if s and isinstance(s, str)]
+        smis_kept = [smiles[i] for i in keep]
+        ids, mask = self.tok.encode_batch(smis_kept)
+        return keep, {"ids": ids.to(device), "mask": mask.to(device)}
+
+    def build_finetune_model(self, n_tasks: int, dropout: float = 0.5) -> nn.Module:
+        enc = self._SmilesEncoder(self.cfg)
+        enc.load_state_dict(self.state)
+        return _DistillFinetuneWrapper(enc, self.cfg.output_dim, n_tasks, dropout)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Generic train loop — works with any backend whose model implements
+# `forward(prepared, indices) -> logits`.
+# ──────────────────────────────────────────────────────────────────────────────
+def finetune_once(backend, prepared, Y: np.ndarray, splits, task: str,
+                  device: torch.device, seed: int, n_tasks: int,
+                  epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
                   dropout: float = 0.5) -> float:
     """One fine-tuning run. Returns TEST score at the best-VAL epoch."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     tr, va, te = splits
 
-    ae = make_ae()                                # fresh pretrained encoder
-    model = FineTuneModel(ae, latent_dim, Y.shape[1], dropout=dropout).to(device)
-    opt = torch.optim.Adam(model.trainable_parameters(), lr=lr)
+    model = backend.build_finetune_model(n_tasks, dropout).to(device)
+    # AE wrapper exposes a trimmed param iterator (skips decoders); the distill
+    # wrapper doesn't have that distinction and uses .parameters().
+    params = (model.trainable_parameters() if hasattr(model, "trainable_parameters")
+              else model.parameters())
+    opt = torch.optim.Adam(list(params), lr=lr)
 
     y_t = torch.from_numpy(Y).to(device)
-    higher_better = (task == "classification")
-    best_val = -np.inf if higher_better else np.inf
+    best_auc = -np.inf
+    best_loss = np.inf
     best_test = float("nan")
+    auc_ever_defined = False
 
     rng = np.random.default_rng(seed)
     for ep in range(epochs):
@@ -310,8 +538,7 @@ def finetune_once(make_ae: Callable[[], nn.Module], latent_dim: int,
         order = rng.permutation(len(tr))
         for i in range(0, len(tr), batch_size):
             bidx = [tr[j] for j in order[i:i + batch_size]]
-            batch = collate_fn([samples[j] for j in bidx]).to(device)
-            logits = model(batch)
+            logits = model(prepared, bidx)
             yb = y_t[bidx]
             if task == "classification":
                 loss = _multitask_bce(logits, yb)
@@ -322,35 +549,39 @@ def finetune_once(make_ae: Callable[[], nn.Module], latent_dim: int,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-        val = _evaluate(model, samples, Y, va, collate_fn, device, task, max_atoms)
-        improved = (val > best_val) if higher_better else (val < best_val)
-        if not np.isnan(val) and improved:
-            best_val = val
-            best_test = _evaluate(model, samples, Y, te, collate_fn, device,
-                                  task, max_atoms)
+        val_metric, val_loss = _evaluate(model, prepared, Y, va, task)
+        if task == "classification" and not np.isnan(val_metric):
+            auc_ever_defined = True
+            if val_metric > best_auc:
+                best_auc = val_metric
+                test_metric, _ = _evaluate(model, prepared, Y, te, task)
+                best_test = test_metric
+        else:
+            if not auc_ever_defined and val_loss < best_loss:
+                best_loss = val_loss
+                test_metric, _ = _evaluate(model, prepared, Y, te, task)
+                best_test = test_metric
     return best_test
 
 
-def featurize_dataset(smis: List[str], Y: np.ndarray, featurize_fn: Callable,
-                      max_atoms: int) -> Tuple[list, np.ndarray, List[str]]:
-    """ETKDG-featurize every molecule once. Returns (samples, Y_kept, smis_kept)."""
-    samples, keep = [], []
-    for i, smi in enumerate(smis):
-        s = featurize_fn(smi, max_atoms=max_atoms)
-        if s is None:
-            continue
-        samples.append(s)
-        keep.append(i)
-    return samples, Y[keep], [smis[i] for i in keep]
-
-
-def run_finetune_benchmark(make_ae: Callable[[], nn.Module], latent_dim: int,
-                           featurize_fn: Callable, collate_fn: Callable,
-                           device: torch.device, max_atoms: int,
-                           datasets: List[str], seeds: List[int],
+def run_finetune_benchmark(backend, datasets: List[str], seeds: List[int],
+                           device: Optional[torch.device] = None,
                            epochs: int = 100, batch_size: int = 32,
                            lr: float = 1e-3, dropout: float = 0.5,
-                           train_smiles_path: Optional[str] = None) -> List[dict]:
+                           train_smiles_path: Optional[str] = None,
+                           split_strategy: str = "deterministic") -> List[dict]:
+    """split_strategy:
+        "deterministic"   (default) — largest-first Bemis-Murcko scaffold split
+                          with a one-shot stratification pass; same split for
+                          all seeds. Matches Hu et al. 2020.
+        "random_per_seed" — per-seed-shuffled Bemis-Murcko scaffold split.
+                          Different seeds → different splits. Matches Mole-BERT
+                          and DeepChem's `RandomGroupSplitter`. Needed for
+                          datasets with extreme class imbalance (e.g. ClinTox).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     train_set = None
     if train_smiles_path:
         print(f"[ft] loading leakage set from {train_smiles_path} …")
@@ -369,17 +600,27 @@ def run_finetune_benchmark(make_ae: Callable[[], nn.Module], latent_dim: int,
             Y = y1.reshape(-1, 1)
             print(f"[{name}] leakage filter: dropped {n_leak}/{n_raw}")
 
-        print(f"[{name}] {n_raw} mols, {len(task_names)} task(s); featurizing (ETKDG) …")
-        samples, Yk, smis_k = featurize_dataset(smis, Y, featurize_fn, max_atoms)
-        print(f"[{name}] kept {len(samples)}/{n_raw} after featurize")
+        print(f"[{name}] {n_raw} mols, {len(task_names)} task(s); preparing …")
+        keep_idx, prepared = backend.prepare(smis, device)
+        smis_kept = [smis[i] for i in keep_idx]
+        Y_kept = Y[keep_idx]
+        print(f"[{name}] kept {len(smis_kept)}/{n_raw} after prepare")
 
-        tr, va, te = scaffold_split_3way(smis_k)
-        print(f"[{name}] scaffold 80/10/10 → train={len(tr)} val={len(va)} test={len(te)}")
+        if split_strategy == "deterministic":
+            tr, va, te = stratified_scaffold_split_3way(smis_kept, Y_kept)
+            print(f"[{name}] scaffold 80/10/10 (deterministic) → "
+                   f"train={len(tr)} val={len(va)} test={len(te)}")
 
         scores: List[float] = []
+        last_tr = last_va = last_te = []
         for sd in seeds:
-            s = finetune_once(make_ae, latent_dim, samples, Yk, (tr, va, te),
-                              task, collate_fn, device, max_atoms, seed=sd,
+            if split_strategy == "random_per_seed":
+                tr, va, te = random_scaffold_split_3way(smis_kept, seed=sd)
+                print(f"[{name}] scaffold 80/10/10 (random, seed={sd}) → "
+                       f"train={len(tr)} val={len(va)} test={len(te)}")
+            last_tr, last_va, last_te = tr, va, te
+            s = finetune_once(backend, prepared, Y_kept, (tr, va, te), task,
+                              device, seed=sd, n_tasks=Y_kept.shape[1],
                               epochs=epochs, batch_size=batch_size, lr=lr,
                               dropout=dropout)
             scores.append(s)
@@ -390,8 +631,9 @@ def run_finetune_benchmark(make_ae: Callable[[], nn.Module], latent_dim: int,
                f"over {len(seeds)} seeds  ({time.time()-t0:.0f}s)")
         results.append({
             "dataset": name, "task": task, "metric": metric,
-            "n_tasks": len(task_names), "n_kept": len(samples),
-            "n_train": len(tr), "n_val": len(va), "n_test": len(te),
+            "split_strategy": split_strategy,
+            "n_tasks": Y_kept.shape[1], "n_kept": len(smis_kept),
+            "n_train": len(last_tr), "n_val": len(last_va), "n_test": len(last_te),
             "mean": float(np.nanmean(arr)), "std": float(np.nanstd(arr)),
             "scores": scores,
         })

@@ -1,9 +1,8 @@
 """
 Train the Pairformer MolStructAutoencoder on precomputed shards.
 
-Reconstruction losses (10 per-track) + KL regularizer. No contrastive head,
-no cross-track-consistency module — both removed as part of the move to the
-unified Pairformer backbone.
+Loss = 10 per-track reconstruction terms + a small β-VAE KL regularizer.
+See mol_struct_ae/losses.py for the per-track definitions.
 
 Run locally (for testing):
     python train_mol_struct_ae.py --shard-dir data/shards --epochs 1 --batch-size 16

@@ -73,7 +73,7 @@ def precompute_features(
     workers: int = 8,
     limit: int = 0,
     csv_path: str = "",            # if "", use bundled data/zinc250k.csv
-    shard_dir: str = "",           # if "", use the legacy SHARD_DIR
+    shard_dir: str = "",           # default to SHARD_DIR when empty
 ) -> None:
     import os
     import subprocess
@@ -521,48 +521,24 @@ def extract_train_smiles(shard_dir: str = "", out_path: str = ""):
 @app.function(
     image=image,
     gpu="A10G",
-    timeout=60 * 60 * 12,
+    timeout=60 * 60 * 24,
     volumes={RUNS_DIR: runs_vol},
 )
 def moleculenet_finetune_modal(checkpoint: str, datasets: list, seeds: list,
                                 epochs: int = 100, batch_size: int = 32,
                                 lr: float = 1e-3, dropout: float = 0.5,
-                                train_smiles_path: str = "") -> list:
+                                train_smiles_path: str = "",
+                                split_strategy: str = "deterministic") -> list:
     import sys
     sys.path.insert(0, REMOTE_DIR)
-    import torch
-    from mol_struct_ae import MolStructAutoencoder
-    from mol_struct_ae.model import MolAEConfig
-    from mol_struct_ae.dataset import make_collate_fn
-    from utils.featurize import featurize_smiles
-    from utils.benchmark_moleculenet import run_finetune_benchmark
+    from utils.benchmark_moleculenet import AEBackend, run_finetune_benchmark
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    cfg_args = ckpt.get("config", {})
-    cfg = MolAEConfig(
-        max_atoms=cfg_args.get("max_atoms", 64),
-        hidden_dim=cfg_args.get("hidden", 96),
-        latent_dim=cfg_args.get("latent", 256),
-    )
-    state = ckpt["model"]
-    print(f"[ft] loaded ckpt step={ckpt.get('step','?')} max_atoms={cfg.max_atoms} "
-           f"hidden={cfg.hidden_dim} latent={cfg.latent_dim}")
-
-    # Each seed needs a FRESH pretrained encoder (fine-tuning mutates weights).
-    def make_ae():
-        ae = MolStructAutoencoder(cfg)
-        ae.load_state_dict(state)
-        return ae
-
-    collate_fn = make_collate_fn(cfg.max_atoms, cfg_args.get("max_dihedrals", 64))
+    backend = AEBackend(checkpoint)
     return run_finetune_benchmark(
-        make_ae=make_ae, latent_dim=cfg.latent_dim,
-        featurize_fn=featurize_smiles, collate_fn=collate_fn,
-        device=device, max_atoms=cfg.max_atoms,
-        datasets=datasets, seeds=seeds, epochs=epochs,
+        backend, datasets=datasets, seeds=seeds, epochs=epochs,
         batch_size=batch_size, lr=lr, dropout=dropout,
         train_smiles_path=train_smiles_path or None,
+        split_strategy=split_strategy,
     )
 
 
@@ -578,7 +554,8 @@ def moleculenet_finetune(checkpoint: str = "",
                          datasets: str = "BBBP,BACE,ClinTox,SIDER",
                          seeds: str = "0,1,2",
                          epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
-                         train_smiles_path: str = ""):
+                         train_smiles_path: str = "",
+                         split_strategy: str = "deterministic"):
     """Fine-tuning benchmark replicating Mole-BERT's protocol (Table 1).
 
     Fine-tunes the pretrained encoder END-TO-END per dataset (scaffold 80/10/10,
@@ -596,10 +573,12 @@ def moleculenet_finetune(checkpoint: str = "",
     train_smis = train_smiles_path  # default empty: leakage filter only for single-task
     print(f"[moleculenet_finetune] ckpt={ckpt}")
     print(f"  datasets: {ds_list}   seeds: {seed_list}   epochs={epochs}")
+    print(f"  split_strategy: {split_strategy}")
     res = moleculenet_finetune_modal.remote(
         checkpoint=ckpt, datasets=ds_list, seeds=seed_list,
         epochs=epochs, batch_size=batch_size, lr=lr,
         train_smiles_path=train_smis,
+        split_strategy=split_strategy,
     )
 
     print("\n" + "=" * 78)

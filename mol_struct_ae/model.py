@@ -45,7 +45,7 @@ class MolAEConfig:
     latent_dim: int = 256
     heads: int = 4
     num_pairformer_blocks: int = 4
-    # Decoder context tokens (replaces the old 5 track tokens for compatibility)
+    # Decoder cross-attention memory tokens produced by GlobalAggregator
     num_context_tokens: int = 5
     # Input feature dims (override if you change featurization)
     atom_feat_dim: int = ATOM_FEAT_DIM

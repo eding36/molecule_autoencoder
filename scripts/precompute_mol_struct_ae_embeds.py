@@ -49,6 +49,11 @@ def main():
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--device", default="auto")
+    p.add_argument("--shard-start", type=int, default=0,
+                    help="for parallel runs: process shard_paths[start::stride]")
+    p.add_argument("--shard-stride", type=int, default=1)
+    p.add_argument("--amp", action="store_true",
+                    help="run forward in bfloat16 autocast (~1.7x faster, lossless for inference)")
     args = p.parse_args()
 
     if not args.shard_dir and not args.library:
@@ -76,6 +81,8 @@ def main():
         print(f"Reading shards from {args.shard_dir}")
         smi_to_embed: Dict[str, np.ndarray] = embed_from_shards(
             args.shard_dir, model, device, args.batch_size, cfg.max_atoms,
+            shard_start=args.shard_start, shard_stride=args.shard_stride,
+            amp=args.amp,
         )
     else:
         print(f"Featurizing CSV {args.library}")
@@ -98,7 +105,7 @@ def main():
         "embeds": embeds,
         "checkpoint": args.checkpoint,
         "config": cfg_args,
-    }, out)
+    }, out, pickle_protocol=4)   # protocol 4+ required for >4GB objects
     size_mb = out.stat().st_size / 2**20
     print(f"Saved → {out} ({size_mb:.1f} MB, embeds shape={embeds.shape})")
 

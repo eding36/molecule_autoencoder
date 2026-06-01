@@ -47,8 +47,7 @@ class MolSample:
     """A single molecule's multi-track raw inputs (variable atom count).
 
     SE(3)-invariant by construction: only scalar geometric features (bond
-    lengths / angles / dihedrals) are stored — no raw coordinates and no
-    orientation-dependent voxel grid.
+    lengths / angles / dihedrals) are stored — no raw coordinates.
     """
     atom_feats_2d: torch.Tensor       # [N, F_atom]
     bond_feats_2d: torch.Tensor       # [E, F_bond]
