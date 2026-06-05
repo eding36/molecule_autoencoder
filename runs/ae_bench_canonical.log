@@ -1,4 +1,31 @@
-╭─ Error ──────────────────────────────────────────────────────────────────────╮
-│ App creation failed: workspace billing cycle spend limit reached             │
-╰──────────────────────────────────────────────────────────────────────────────╯
 Note that running a local entrypoint in detached mode only keeps the last triggered Modal function alive after the parent process has been killed or disconnected.
+✓ Initialized. View run at 
+https://modal.com/apps/eding3602/main/ap-XlAQ1qI3sVkMPCgq098eaQ
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/eding36/VSCodeProjects/mol_struct_ae/modal_mol_struct_ae.py
+├── 🔨 Created mount /Users/eding36/VSCodeProjects/mol_struct_ae
+├── 🔨 Created function precompute_features.
+├── 🔨 Created function train_mol_struct_ae_modal.
+├── 🔨 Created function wait_and_train.
+├── 🔨 Created function build_index_cache.
+├── 🔨 Created function copy_on_volume_modal.
+├── 🔨 Created function simsearch_modal.
+├── 🔨 Created function extract_train_smiles_modal.
+├── 🔨 Created function moleculenet_finetune_modal.
+├── 🔨 Created function fetch_zinc15_modal.
+└── 🔨 Created function diversify_zinc15_modal.
+[moleculenet_finetune] ckpt=/root/runs/v3_kl2e3/ckpt_step102000.pt
+  datasets: ['BBBP', 'SIDER', 'ClinTox', 'BACE', 'Tox21']   seeds: [0, 1, 2]   epochs=100
+  split_override: (per-dataset DATASET_PROTOCOL)
+[AEBackend] ckpt step=102000 max_atoms=96 hidden=128 latent=256
+
+[BBBP] downloading + parsing …
+[download] https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/BBBP.csv
+[BBBP] 2050 mols, 1 task(s); protocol: split=scaffold metric=auroc
+[BBBP] kept 1981/2050 after prepare
+[BBBP] 80/10/10 (scaffold, seed=0) → train=1584 val=198 test=199
+[BBBP] seed=0 test=0.8129
+[BBBP] 80/10/10 (scaffold, seed=1) → train=1584 val=198 test=199
+[BBBP] seed=1 test=0.8782
+[BBBP] 80/10/10 (scaffold, seed=2) → train=1584 val=198 test=199

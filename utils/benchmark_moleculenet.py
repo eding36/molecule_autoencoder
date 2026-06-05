@@ -235,21 +235,20 @@ def _murcko(smi: str) -> str:
 def scaffold_split_3way(smiles: List[str], frac_train: float = 0.8,
                          frac_val: float = 0.1
                          ) -> Tuple[List[int], List[int], List[int]]:
-    groups: Dict[str, List[int]] = defaultdict(list)
-    for i, s in enumerate(smiles):
-        groups[_murcko(s)].append(i)
-    sorted_groups = sorted(groups.values(), key=lambda g: (-len(g), smiles[g[0]]))
-    n = len(smiles)
-    n_train, n_val = int(frac_train * n), int(frac_val * n)
-    train, val, test = [], [], []
-    for g in sorted_groups:
-        if len(train) + len(g) <= n_train:
-            train.extend(g)
-        elif len(val) + len(g) <= n_val:
-            val.extend(g)
-        else:
-            test.extend(g)
-    return train, val, test
+    """DeepChem `ScaffoldSplitter` — deterministic largest-first scaffold split.
+
+    Matches the MoleculeNet paper protocol exactly (DeepChem default).
+    """
+    import deepchem as dc
+    frac_test = 1.0 - frac_train - frac_val
+    dataset = dc.data.NumpyDataset(
+        X=np.zeros((len(smiles), 1)), ids=np.array(smiles, dtype=object),
+    )
+    splitter = dc.splits.ScaffoldSplitter()
+    tr, va, te = splitter.split(
+        dataset, frac_train=frac_train, frac_valid=frac_val, frac_test=frac_test,
+    )
+    return list(map(int, tr)), list(map(int, va)), list(map(int, te))
 
 
 def random_split_3way(n: int, seed: int,
@@ -632,8 +631,10 @@ def run_finetune_benchmark(backend, datasets: List[str], seeds: List[int],
     comparisons).
 
     Splits:
-      "scaffold" — Bemis-Murcko scaffold groups, per-seed-shuffled (DeepChem
-                   `RandomGroupSplitter`). Scaffold-disjoint within a seed.
+      "scaffold" — Bemis-Murcko scaffold groups, sorted largest-first then
+                   greedily allocated to train/val/test. Deterministic across
+                   seeds (only model init / minibatch order varies). Matches
+                   DeepChem's `ScaffoldSplitter` and the MoleculeNet paper.
       "random"   — pure-random index permutation per seed. Not
                    scaffold-disjoint. The canonical MoleculeNet protocol
                    for the broad-assay multi-task sets.
@@ -678,7 +679,7 @@ def run_finetune_benchmark(backend, datasets: List[str], seeds: List[int],
         last_tr = last_va = last_te = []
         for sd in seeds:
             if ds_split == "scaffold":
-                tr, va, te = random_scaffold_split_3way(smis_kept, seed=sd)
+                tr, va, te = scaffold_split_3way(smis_kept)
             elif ds_split == "random":
                 tr, va, te = random_split_3way(len(smis_kept), seed=sd)
             else:

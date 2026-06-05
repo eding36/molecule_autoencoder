@@ -46,6 +46,7 @@ image = (
         "pandas>=2.0",
         "tqdm>=4.65",
         "scikit-learn>=1.3",
+        "deepchem>=2.7",
     )
     .add_local_dir(
         LOCAL_PROJECT,

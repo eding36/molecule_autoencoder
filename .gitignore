@@ -8,7 +8,7 @@ __pycache__/
 # Training / data outputs (large, regenerable)
 data/shards*/
 *.pt
-.log
+*.log
 
 # Editor / OS
 .DS_Store
