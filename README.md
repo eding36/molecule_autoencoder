@@ -5,7 +5,7 @@ This README covers:
 2. [Architectures & Input Features](#architectures) — the Pairformer-based encoder (mol_struct_ae) (single + pair representations updated jointly at every block, AF3-style), the latent, and the per-track decoders. Plus the `distillation` model.3. [Featurization](#featurization) — how raw molecules are turned into `MolSample`s and sharded to disk.
 4. [Training](#training) — stage 1 (mol_struct_ae) and stage 2 (distillation).
 5. [Inference](#inference) — embedding any SMILES with the distillation model. Similarity searching.
-6. [Repo layout and running](#repo-layout) — also covers the MoleculeNet
+6. [Benchmarking](#benchmarking) —Using the MoleculeNet
    fine-tuning benchmark, leakage-filtered against the training set.
 
 ## Overview
@@ -51,7 +51,7 @@ SMILES ───────────→ distillation → embedding
 
 ---
 
-## Architectures & Input Features
+## Architectures
 
 ### Molecular Autoencoder (mol_struct_ae)
 
