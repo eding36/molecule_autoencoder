@@ -679,7 +679,7 @@ def run_finetune_benchmark(backend, datasets: List[str], seeds: List[int],
         last_tr = last_va = last_te = []
         for sd in seeds:
             if ds_split == "scaffold":
-                tr, va, te = scaffold_split_3way(smis_kept)
+                tr, va, te = random_scaffold_split_3way(smis_kept, seed=sd)
             elif ds_split == "random":
                 tr, va, te = random_split_3way(len(smis_kept), seed=sd)
             else:

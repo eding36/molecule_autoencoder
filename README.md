@@ -424,15 +424,16 @@ the training shards.
 ### Split & metric
 
 All benchmarks use **scaffold split across every dataset** (`--split-override scaffold`):
-Bemis-Murcko scaffold groups are assigned to train/val/test by the deterministic
-largest-first algorithm (`scaffold_split_3way`, equivalent to DeepChem's
-`ScaffoldSplitter`). The split is identical across seeds; variance in reported
-mean ± std comes from training-time randomness (weight init, dropout).
+Bemis-Murcko scaffold groups are assigned to train/val/test in a per-seed-randomized
+order (`random_scaffold_split_3way`, equivalent to DeepChem's `RandomGroupSplitter`).
+Different seeds produce different scaffold assignments, so positives and negatives
+distribute naturally across splits — this avoids the degenerate AUROC that the
+deterministic largest-first variant produces on imbalanced sets like ClinTox.
 
 | Dataset | Split | Metric |
 |---------|-------|--------|
-| BBBP, BACE, HIV, Tox21, ToxCast, SIDER, ClinTox | scaffold 80/10/10 | ROC-AUC |
-| MUV | scaffold 80/10/10 | **AUPRC** (extreme imbalance ~0.2% positives — AUROC uninformative) |
+| BBBP, BACE, HIV, Tox21, ToxCast, SIDER, ClinTox | scaffold 80/10/10 (random per seed) | ROC-AUC |
+| MUV | scaffold 80/10/10 (random per seed) | **AUPRC** (extreme imbalance ~0.2% positives — AUROC uninformative) |
 | ESOL, FreeSolv, Lipo | scaffold 80/10/10 | RMSE |
 
 The `DATASET_PROTOCOL` table in `utils/benchmark_moleculenet.py` still records per-dataset
