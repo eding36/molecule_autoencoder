@@ -1,0 +1,19 @@
+{
+  "shard_dir": "/root/runs/shards_zinc15_5m_diverse_96",
+  "out_dir": "/root/runs/zinc15_5m_diverse_run_pairformer_v3_kl2e3",
+  "epochs": 1,
+  "batch_size": 24,
+  "num_workers": 4,
+  "max_atoms": 96,
+  "max_dihedrals": 64,
+  "hidden": 128,
+  "latent": 256,
+  "lr": 0.0003,
+  "warmup_frac": 0.03,
+  "grad_clip": 1.0,
+  "log_every": 50,
+  "ckpt_every": 2000,
+  "amp": true,
+  "resume": "/root/runs/zinc15_5m_diverse_run_pairformer_v3/ckpt_step062000.pt",
+  "device": "cuda"
+}

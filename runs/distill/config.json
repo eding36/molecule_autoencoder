@@ -1,0 +1,20 @@
+{
+  "pairs": "/root/runs/teacher_embeds.pt",
+  "vocab": "/root/mol_struct_ae/runs/vocab.json",
+  "out_dir": "/root/runs/distill",
+  "hidden": 256,
+  "num_layers": 6,
+  "num_heads": 8,
+  "dropout": 0.1,
+  "max_len": 128,
+  "epochs": 20,
+  "batch_size": 256,
+  "lr": 0.0003,
+  "weight_decay": 0.0001,
+  "warmup_frac": 0.03,
+  "val_frac": 0.02,
+  "log_every": 50,
+  "ckpt_every": 2000,
+  "device": "cuda",
+  "seed": 0
+}
