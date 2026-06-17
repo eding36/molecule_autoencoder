@@ -113,8 +113,8 @@ At every block, single and pair representations exchange information bidirection
 
 #### Featurization
 
-The ready-to-run pipeline is in [utils/featurize.py](utils/featurize.py).
-It's generic — point it at any CSV with a SMILES column:
+Featurization is in [utils/featurize.py](utils/featurize.py).
+It takes in a csv file with a smiles column, and you can set the column name with the arg --smiles-col 
 
 ```bash
 python utils/featurize.py \
