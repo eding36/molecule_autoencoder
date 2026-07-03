@@ -17,7 +17,7 @@ Forward pass:
        μ/log σ² for light VAE regularization) plus 5 context tokens for the
        decoders.
     4. Each track's decoder reconstructs the original inputs from z + the
-       context tokens.
+       context tokens from GlobalAggregator
 
 The model returns a dict of predictions; losses are computed in losses.py.
 """

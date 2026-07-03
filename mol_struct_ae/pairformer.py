@@ -1,7 +1,5 @@
 """
-Pairformer-lite for molecular structure autoencoding.
-
-Unified backbone modelled on AlphaFold-3's Pairformer. Two representations:
+Pairformer trunk modelled on AlphaFold-3's Pairformer. Two representations:
 
     single_repr  [B, N, d_single]   - per-atom features
     pair_repr    [B, N, N, d_pair]  - per-(atom, atom) features
@@ -19,9 +17,6 @@ A `PairformerBlock` does, at each layer:
     4. single += AttnWithPairBias(single, pair)      # pair biases single attention
     5. single += SingleTransition(single)            # single MLP
 
-This is the "Pairformer-lite" — drops AF3's triangle multiplication and
-ending-node triangle attention (we keep only starting-node triangle attention)
-to fit in our compute budget at N=96.
 """
 from __future__ import annotations
 
