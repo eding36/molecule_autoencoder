@@ -37,7 +37,7 @@ class AtomQueryDecoder(nn.Module):
     def forward(self, z: torch.Tensor, ctx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # z: [B, d_latent], ctx: [B, K, hidden] (e.g. fused track tokens)
         B = z.shape[0]
-        q = self.queries.unsqueeze(0).expand(B, -1, -1)                    # [B, N, hidden]
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)                    # [B, N, hidden], reshape query to batch dimension
         memory = torch.cat([self.latent_proj(z).unsqueeze(1), ctx], dim=1)  # [B, 1+K, hidden]
         h = self.decoder(q, memory)                                         # [B, N, hidden]
         atom_logits = self.mask_head(h).squeeze(-1)                         # [B, N]

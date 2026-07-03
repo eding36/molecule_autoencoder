@@ -1,4 +1,5 @@
 """
+Builds the distillation model training set:
 Run the mol_struct_ae (`MolStructAutoencoder`) over a SMILES library and save the
 (SMILES, sim_embed) pairs that the distillation will be trained against.
 

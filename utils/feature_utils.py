@@ -50,8 +50,7 @@ except RuntimeError:
 FP_RADIUS = 2
 FP_NBITS = 2048
 
-
-# ─── Worker-safe featurize (numpy roundtrip) ─────────────────────────────────
+#Helper func that turns pytorch tensors into a dict of numpy arrays, required for multiprocessing to work
 def _featurize_one(smi: str, max_atoms: int):
     sample = featurize_smiles(smi, max_atoms=max_atoms)
     if sample is None:
@@ -71,7 +70,7 @@ def _featurize_one(smi: str, max_atoms: int):
     }
     return smi, d
 
-
+#Converts numpy dict to molsample (with torch tensors)
 def _dict_to_sample(d) -> MolSample:
     return MolSample(
         atom_feats_2d=torch.from_numpy(d["atom_feats_2d"]),
@@ -114,7 +113,7 @@ def featurize_all(smiles_list: List[str], max_atoms: int,
     return out
 
 
-# ─── Model embedding (batched) ───────────────────────────────────────────────
+# ─── Autoencoder Pairformer embedding (batched, but loads all featurized smiles at once, memory intensive, only use for <250K smiles) ───────────────────────────────────────────────
 @torch.no_grad()
 def embed_all(samples_by_smiles: Dict[str, MolSample], model: MolStructAutoencoder,
               device: torch.device, batch_size: int, max_atoms: int) -> Dict[str, np.ndarray]:
@@ -135,18 +134,18 @@ def embed_all(samples_by_smiles: Dict[str, MolSample], model: MolStructAutoencod
     return {smi: E[i] for i, smi in enumerate(smis)}
 
 
-# ─── Shard-based embedding (skips re-featurization) ──────────────────────────
+# ─── Shard-based embedding (streams batches of shards, memory efficient, use for >250k smiles) ──────────────────────────
 @torch.no_grad()
 def embed_from_shards(shard_dir: str, model: MolStructAutoencoder,
                        device: torch.device, batch_size: int, max_atoms: int,
                        pattern: str = "shard_*.pt",
                        shard_start: int = 0, shard_stride: int = 1,
                        amp: bool = False) -> Dict[str, np.ndarray]:
-    """Load each shard, drop oversize / SMILES-less samples, embed in batches.
+    """Load each shard, embed in batches.
 
     Args:
       shard_start, shard_stride: process `shard_paths[shard_start::shard_stride]`.
-        Use to partition work across N parallel workers — each worker passes
+      N parallel workers, with each worker passing
         `shard_start=i, shard_stride=N` for i in 0..N-1; together they cover
         every shard exactly once.
       amp: if True, run the forward pass under `torch.autocast(..., bfloat16)`.

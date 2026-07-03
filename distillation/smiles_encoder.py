@@ -5,13 +5,10 @@ Inputs: token IDs + attention mask from `SmilesTokenizer`.
 Output: an L2-normalized embedding of dimension `output_dim`, matching the
 mol_struct_ae's `sim_embed`.
 
-Architecture: standard pre-norm transformer encoder over the SMILES sequence
+Architecture: standard transformer encoder over the SMILES sequence
 with a learned `<cls>` token (id=1) at position 0. The CLS hidden state is
 passed through a small MLP head → L2-normalized → output.
 
-Why CLS pool and not mean pool: CLS lets the model concentrate task-relevant
-information into one position rather than averaging it across all tokens. This
-is the BERT/ChemBERTa convention and works well for distillation targets.
 """
 from __future__ import annotations
 

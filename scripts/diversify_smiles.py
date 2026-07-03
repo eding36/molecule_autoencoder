@@ -1,8 +1,8 @@
 """
-Subsample a SMILES CSV with **scaffold-aware** diversity selection.
+Subsample a large SMILES CSV with **scaffold-aware** diversity selection. Used to subsample the ZINC15 dataset for model training.
 
 Algorithm:
-  1. Compute the Bemis-Murcko scaffold for every SMILES (parallel RDKit).
+  1. Compute the Bemis-Murcko scaffold for every SMILES (parallelized process).
   2. Group SMILES by scaffold → dict[scaffold_smiles → list[smi]].
   3. Round-robin pick across scaffolds until `--target-count` is reached:
        round 1: 1 mol from each scaffold     (≈ all unique scaffolds)
@@ -11,12 +11,7 @@ Algorithm:
      This caps how many molecules any single scaffold can contribute before
      under-represented scaffolds get a chance — giving a more uniform spread
      across chemical space than uniform random sampling.
-
-Why scaffolds (Bemis-Murcko) and not random sampling:
-  ZINC15-10M is a curated lead-like set, but scaffold frequency is highly
-  skewed (a handful of common cores dominate). Random sampling preserves that
-  skew; scaffold round-robin actively flattens it. The result trains a more
-  generally-applicable representation.
+Allows for stratified sampling.
 
 CLI:
     python scripts/diversify_smiles.py \\

@@ -1,7 +1,7 @@
 """
 MoleculeNet *fine-tuning* benchmark — replicates the Hu et al. (2020) /
 Mole-BERT (Xia et al., ICLR 2023) protocol: the pretrained encoder is
-fine-tuned end-to-end per dataset (no frozen probe).
+fine-tuned end-to-end per dataset (no frozen weights).
 
 Protocol (per dataset, matching Mole-BERT §5.2 / Appendix E):
   1. Download + parse the dataset CSV.
@@ -11,18 +11,11 @@ Protocol (per dataset, matching Mole-BERT §5.2 / Appendix E):
   4. Bemis-Murcko scaffold split 80/10/10 (train/val/test).
   5. Attach a task head to the *pretrained encoder* and FINE-TUNE END-TO-END
      (encoder + head), 100 epochs, batch 32, Adam lr=1e-3, dropout=0.5.
-  6. Model selection: report TEST ROC-AUC (cls) / RMSE (reg) at the epoch with
+  6. Model selection: report TEST ROC-AUC at the epoch with
      the best VALIDATION score (early-stopping-by-checkpoint protocol).
   7. Repeat over N seeds (default 10); report mean (std).
-
-Defining traits:
-  * end-to-end fine-tuning of the encoder, not a frozen sklearn probe;
-  * 80/10/10 split with a validation set used for model selection;
-  * multi-seed mean/std;
-  * native multi-task support (Tox21/ToxCast/SIDER/MUV/ClinTox) via masked BCE.
-
-This is the apples-to-apples harness for comparing against Mole-BERT Table 1.
 """
+
 from __future__ import annotations
 
 import csv
@@ -89,9 +82,7 @@ RDLogger.DisableLog("rdApp.*")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dataset configs — single AND multi-task. `labels="auto"` means "every column
-# except the listed non-label columns is a binary task" (used for the big
-# multi-task assay sets). NaN / empty cells are treated as missing labels.
+#Dataset configs, with task being classification / regression, and smiles col being the name of the smiles col
 # ──────────────────────────────────────────────────────────────────────────────
 DATASETS: Dict[str, dict] = {
     # ── single-task classification ──────────────────────────────────────────
@@ -150,7 +141,7 @@ DATASETS: Dict[str, dict] = {
 }
 
 
-# Per-dataset canonical MoleculeNet protocols (split + primary metric):
+# Per-dataset MoleculeNet protocols (split + primary metric):
 #  * scaffold split for the structurally-driven tasks (BBBP, BACE, HIV) — labels
 #    depend on 2D/3D structure, so scaffold-disjoint splits test generalization
 #    to novel cores.
@@ -165,12 +156,12 @@ DATASET_PROTOCOL = {
     "BACE":    {"split": "scaffold", "metric": "auroc"},
     "HIV":     {"split": "scaffold", "metric": "auroc"},
     # classification — random split, ROC-AUC
-    "Tox21":   {"split": "random",   "metric": "auroc"},
-    "ToxCast": {"split": "random",   "metric": "auroc"},
-    "SIDER":   {"split": "random",   "metric": "auroc"},
-    "ClinTox": {"split": "random",   "metric": "auroc"},
+    "Tox21":   {"split": "scaffold",   "metric": "auroc"},
+    "ToxCast": {"split": "scaffold",   "metric": "auroc"},
+    "SIDER":   {"split": "scaffold",   "metric": "auroc"},
+    "ClinTox": {"split": "scaffold",   "metric": "auroc"},
     # classification — random split, AUPRC (extreme imbalance)
-    "MUV":     {"split": "random",   "metric": "auprc"},
+    "MUV":     {"split": "scaffold",   "metric": "auprc"},
     # regression — scaffold split, RMSE (sane default for the regression sets)
     "ESOL":    {"split": "scaffold", "metric": "rmse"},
     "FreeSolv":{"split": "scaffold", "metric": "rmse"},
@@ -218,9 +209,7 @@ def load_dataset_multitask(name: str) -> Tuple[List[str], np.ndarray, str, List[
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3-way Bemis-Murcko scaffold split (80/10/10).
-# Deterministic largest-first scaffold assignment (Hu et al. style); the seed
-# only perturbs tie ordering so the split is essentially fixed across seeds and
-# the std reflects init/training stochasticity — matching the Hu et al. protocol.
+# Deterministic largest-first scaffold assignment (Hu et al. style)
 # ──────────────────────────────────────────────────────────────────────────────
 def _murcko(smi: str) -> str:
     m = Chem.MolFromSmiles(smi)
@@ -254,13 +243,7 @@ def scaffold_split_3way(smiles: List[str], frac_train: float = 0.8,
 def random_split_3way(n: int, seed: int,
                        frac_train: float = 0.8, frac_val: float = 0.1
                        ) -> Tuple[List[int], List[int], List[int]]:
-    """Pure-random 80/10/10 index permutation — NOT scaffold-disjoint.
-
-    The MoleculeNet-recommended protocol for datasets where the labels are
-    not driven by structural-novelty generalization: Tox21, ToxCast, SIDER,
-    ClinTox, MUV. For these, scaffold-disjointness over-penalizes — random
-    splitting matches the way these labels are actually used in practice.
-    """
+    """Pure-random 80/10/10 split. """
     rng = np.random.default_rng(seed)
     perm = rng.permutation(n).tolist()
     n_train = int(frac_train * n)
@@ -280,8 +263,7 @@ def random_scaffold_split_3way(
     two splits), but the order in which scaffold groups are assigned to
     train/val/test is shuffled with `seed`. Different seeds produce different
     splits, so positives/negatives naturally distribute across train/val/test
-    across the seed range — fixes the extreme-imbalance pathology that the
-    deterministic largest-first variant exhibits on ClinTox.
+    across the seed range — fixes the extreme-imbalance on ClinTox predictions.
 
     This matches DeepChem's `RandomGroupSplitter` behavior, which appears to be
     Mole-BERT's actual MoleculeNet split (their ClinTox = 0.789 is incompatible
@@ -304,84 +286,6 @@ def random_scaffold_split_3way(
             val.extend(g)
         else:
             test.extend(g)
-    return train, val, test
-
-
-def stratified_scaffold_split_3way(
-    smiles: List[str], Y: np.ndarray,
-    frac_train: float = 0.8, frac_val: float = 0.1,
-) -> Tuple[List[int], List[int], List[int]]:
-    """Scaffold-disjoint split that additionally ensures each binary task has
-    both classes present in val and test (when feasible).
-
-    Starts from the deterministic largest-first scaffold split, then for each
-    task checks val/test class diversity; if a split is missing a class, moves
-    the smallest train scaffold group containing the missing class into that
-    split. No-op for datasets whose splits already have class diversity (e.g.
-    BBBP, BACE, Tox21) — preserves prior results bit-for-bit when no swap is
-    needed. Designed for ClinTox-style extreme class imbalance.
-    """
-    groups: Dict[str, List[int]] = defaultdict(list)
-    for i, s in enumerate(smiles):
-        groups[_murcko(s)].append(i)
-    sorted_groups = sorted(groups.values(), key=lambda g: (-len(g), smiles[g[0]]))
-
-    n = len(smiles)
-    n_train, n_val = int(frac_train * n), int(frac_val * n)
-    train, val, test = [], [], []
-    train_groups: List[List[int]] = []
-    val_groups:   List[List[int]] = []
-    test_groups:  List[List[int]] = []
-    for g in sorted_groups:
-        if len(train) + len(g) <= n_train:
-            train.extend(g); train_groups.append(g)
-        elif len(val) + len(g) <= n_val:
-            val.extend(g); val_groups.append(g)
-        else:
-            test.extend(g); test_groups.append(g)
-
-    Y = np.asarray(Y)
-    n_tasks = Y.shape[1] if Y.ndim == 2 else 1
-
-    def _has_both_classes(idx_list, t):
-        yt = Y[idx_list, t]
-        yt = yt[~np.isnan(yt)]
-        if len(yt) == 0:
-            return True  # no labels — nothing to stratify
-        return len(np.unique(yt)) >= 2
-
-    def _smallest_train_group_with(t, target_class):
-        best, best_size = None, float("inf")
-        for tg in train_groups:
-            yt = Y[tg, t]
-            yt = yt[~np.isnan(yt)]
-            if (yt == target_class).any() and len(tg) < best_size:
-                best, best_size = tg, len(tg)
-        return best
-
-    swaps = 0
-    for t in range(n_tasks):
-        for split_idx, split_groups in ((val, val_groups), (test, test_groups)):
-            if _has_both_classes(split_idx, t):
-                continue
-            yt = Y[split_idx, t]
-            yt = yt[~np.isnan(yt)]
-            present = int(yt[0]) if len(yt) > 0 else 1
-            missing = 1 - present
-            donor = _smallest_train_group_with(t, missing)
-            if donor is None:
-                continue
-            for idx in donor:
-                train.remove(idx)
-                split_idx.append(idx)
-            train_groups.remove(donor)
-            split_groups.append(donor)
-            swaps += 1
-
-    if swaps:
-        print(f"[stratify] moved {swaps} scaffold group(s) from train to "
-               f"val/test to ensure class diversity")
-
     return train, val, test
 
 
@@ -463,11 +367,10 @@ class _AEFinetuneWrapper(nn.Module):
         return self.head(self.dropout(mu))
 
     def trainable_parameters(self):
-        # Encoder path only — decoders are not in the forward graph but live
-        # in `ae.parameters()`; excluding them avoids spurious weight decay.
+        #only include encoder weights (input_embedder, pairformer, aggregator) in the fine-tuning backprop graph, dont change decoder weights
         for mod in (self.ae.input_embedder, self.ae.pairformer, self.ae.aggregator):
-            yield from mod.parameters()
-        yield from self.dropout.parameters()
+            yield from mod.parameters() 
+        yield from self.dropout.parameters() #also include classification task head weights
         yield from self.head.parameters()
 
 
@@ -488,7 +391,7 @@ class _DistillFinetuneWrapper(nn.Module):
 
 
 class AEBackend:
-    """Pairformer mol_struct_ae fine-tune backend (RDKit ETKDG featurization)."""
+    """Autoencoder pairformer mol_struct_ae fine-tune backend."""
     def __init__(self, checkpoint_path: str):
         import torch as _torch
         from mol_struct_ae import MolStructAutoencoder
@@ -521,7 +424,7 @@ class AEBackend:
             samples.append(s); keep.append(i)
         return keep, {"samples": samples, "device": device}
 
-    def build_finetune_model(self, n_tasks: int, dropout: float = 0.5) -> nn.Module:
+    def build_finetune_model(self, n_tasks: int, dropout: float = 0.5) -> nn.Module: #attaches a classification task head, weights are all tunable here
         ae = self._MolStructAutoencoder(self.cfg)
         ae.load_state_dict(self.state)
         return _AEFinetuneWrapper(ae, self.cfg.latent_dim, n_tasks, dropout,
@@ -529,7 +432,7 @@ class AEBackend:
 
 
 class DistillBackend:
-    """SMILES-only distillation fine-tune backend (no featurization)."""
+    """Distillation model fine-tune backend."""
     def __init__(self, checkpoint_path: str, vocab_path: str):
         import torch as _torch
         from distillation.smiles_encoder import SmilesEncoder, SmilesEncoderConfig
@@ -554,7 +457,7 @@ class DistillBackend:
         ids, mask = self.tok.encode_batch(smis_kept)
         return keep, {"ids": ids.to(device), "mask": mask.to(device)}
 
-    def build_finetune_model(self, n_tasks: int, dropout: float = 0.5) -> nn.Module:
+    def build_finetune_model(self, n_tasks: int, dropout: float = 0.5) -> nn.Module: #attach classification task head to distillation model, weights are tunable
         enc = self._SmilesEncoder(self.cfg)
         enc.load_state_dict(self.state)
         return _DistillFinetuneWrapper(enc, self.cfg.output_dim, n_tasks, dropout)
@@ -568,17 +471,16 @@ def finetune_once(backend, prepared, Y: np.ndarray, splits, task: str,
                   device: torch.device, seed: int, n_tasks: int,
                   epochs: int = 100, batch_size: int = 32, lr: float = 1e-3,
                   dropout: float = 0.5, metric: str = "auroc") -> float:
-    """One fine-tuning run. Returns TEST score (in `metric`) at the best-VAL epoch."""
+    """One fine-tuning run."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     tr, va, te = splits
 
-    model = backend.build_finetune_model(n_tasks, dropout).to(device)
-    # AE wrapper exposes a trimmed param iterator (skips decoders); the distill
-    # wrapper doesn't have that distinction and uses .parameters().
+    model = backend.build_finetune_model(n_tasks, dropout).to(device) #builds fine tuned model architecture
+   
     params = (model.trainable_parameters() if hasattr(model, "trainable_parameters")
               else model.parameters())
-    opt = torch.optim.Adam(list(params), lr=lr)
+    opt = torch.optim.Adam(list(params), lr=lr) #only nudge trainable weights!
 
     y_t = torch.from_numpy(Y).to(device)
     best_auc = -np.inf
@@ -631,10 +533,10 @@ def run_finetune_benchmark(backend, datasets: List[str], seeds: List[int],
     comparisons).
 
     Splits:
-      "scaffold" — Bemis-Murcko scaffold groups, sorted largest-first then
-                   greedily allocated to train/val/test. Deterministic across
-                   seeds (only model init / minibatch order varies). Matches
-                   DeepChem's `ScaffoldSplitter` and the MoleculeNet paper.
+      "scaffold" — Bemis-Murcko scaffold groups assigned to train/val/test in
+                   a per-seed-randomized order (`random_scaffold_split_3way`).
+                   Different seeds produce different splits. Equivalent to
+                   DeepChem's `RandomGroupSplitter` / Mole-BERT's protocol.
       "random"   — pure-random index permutation per seed. Not
                    scaffold-disjoint. The canonical MoleculeNet protocol
                    for the broad-assay multi-task sets.

@@ -2,7 +2,7 @@
 Similarity search using the distillation model.
 
 No featurization at inference time — just tokenize the SMILES and run the
-distillation transformer. Library + queries are both raw SMILES strings.
+distillation transformer. 
 
 Side-by-side comparison: cosine similarity on distill_model embeddings vs.
 Morgan-FP Tanimoto (radius=2, 2048 bits) as the baseline.

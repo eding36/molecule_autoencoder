@@ -1,15 +1,6 @@
-"""Morgan-FP + 3-layer MLP from-scratch baseline for MoleculeNet.
+"""Morgan-FP + 3-layer MLP for a negative control comparison to our autoencoder pairformer and distillation model. 
+Tests whether the autoencoder pairformer or distillation model is learning meaningful representations of molecules outside of just it's FP.
 
-The canonical MoleculeNet "Singletask Network" / ECFP-MLP floor — same
-fine-tuning protocol as the pretrained AE / Distill backbones, but with no
-pretraining. Provides an honest "is pretraining helping?" delta when compared
-side-by-side under matching split/metric/seeds.
-
-Backend protocol (matches `AEBackend` / `DistillBackend` in
-`utils.benchmark_moleculenet`):
-    prepare(smiles, device) -> (kept_indices, {"fps": tensor})
-    build_finetune_model(n_tasks, dropout) -> nn.Module
-        whose forward(prepared, indices) -> logits
 """
 from __future__ import annotations
 

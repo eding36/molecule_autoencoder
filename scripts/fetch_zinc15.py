@@ -1,11 +1,10 @@
 """
-Download DeepChem's pre-curated ZINC15 lead-like SMILES subset and emit a
+Download DeepChem's pre-curated ZINC15 lead-like SMILES subset and output a
 single-column CSV ready for `utils/featurize.py`.
 
 DeepChem hosts the 250K/1M/10M lead-like ZINC15 subsets as gzipped tarballs.
 We pull the tarball, extract the inner CSV, and write a clean `smiles`-only
-CSV. No tranche-stitching, no canonical-SMILES dedup pass needed (DeepChem
-already canonicalized the upstream subset).
+CSV. 
 
 Available sizes:
   * 250K  ≈  ~25 MB tarball

@@ -68,7 +68,14 @@ class MolSample:
 
 @dataclass
 class MolBatch:
-    """Padded, dense batch tensors. `atom_mask` marks real atoms."""
+    """Padded batch tensors. `atom_mask` marks real atoms."""
+    #B = batch size
+    #N = max_atoms
+    #F_atom = atom feature dimension
+    #F_bond = bond feature dim
+    #F_atype = atom type dim
+    #F_pharma = pharmaco features dim
+    #T = max_dihedrals
     atom_feats_2d: torch.Tensor       # [B, N, F_atom]
     bond_feats_2d: torch.Tensor       # [B, N, N, F_bond]
     adj_2d: torch.Tensor              # [B, N, N]  (1 if bond exists)
@@ -93,7 +100,7 @@ class MolBatch:
 
 def collate(samples: List[MolSample], max_atoms: int = 64,
              max_dihedrals: int = MAX_DIHEDRALS) -> MolBatch:
-    """Pad a list of `MolSample` into a dense `MolBatch`.
+    """Pad a list of `MolSample`s into a dense `MolBatch`.
 
     Pads to `max_atoms` (raises if any molecule exceeds it).
     """
@@ -104,28 +111,29 @@ def collate(samples: List[MolSample], max_atoms: int = 64,
     F_atype = samples[0].atom_types.shape[-1]
     F_pharma = samples[0].pharma_feats.shape[-1]
 
+    #initialize MolBatch features
     atom_feats_2d = torch.zeros(B, N, F_atom)
     bond_feats_2d = torch.zeros(B, N, N, F_bond)
     adj_2d = torch.zeros(B, N, N)
     atom_types = torch.zeros(B, N, F_atype)
     bond_lengths = torch.zeros(B, N, N)
     bond_angles = torch.zeros(B, N, N, N)
-    angle_mask = torch.zeros(B, N, N, N, dtype=torch.bool)
+    angle_mask = torch.zeros(B, N, N, N, dtype=torch.bool) #Initialize a tensor initially fully masked with shape of max_atoms^3
     partial_charges = torch.zeros(B, N)
     pharma_feats = torch.zeros(B, N, F_pharma)
     T = max_dihedrals
     dihedral_index = torch.zeros(B, T, 4, dtype=torch.long)
     dihedral_angles = torch.zeros(B, T)
-    dihedral_mask = torch.zeros(B, T, dtype=torch.bool)
-    atom_mask = torch.zeros(B, N, dtype=torch.bool)
+    dihedral_mask = torch.zeros(B, T, dtype=torch.bool) #Initialize a tensor initially fully masked with length max_dihedrals 
+    atom_mask = torch.zeros(B, N, dtype=torch.bool) #Initialize a tensor initially fully masked with length max_atoms
     num_atoms = torch.zeros(B, dtype=torch.long)
 
     for b, s in enumerate(samples):
-        n = s.atom_feats_2d.shape[0]
+        n = s.atom_feats_2d.shape[0] #find how many atoms there are in sample
         if n > N:
             raise ValueError(f"Molecule has {n} atoms > max_atoms={N}")
-        atom_mask[b, :n] = True
-        num_atoms[b] = n
+        atom_mask[b, :n] = True #Label the n total atoms of the sample as True (not masked)
+        num_atoms[b] = n 
         atom_feats_2d[b, :n] = s.atom_feats_2d
         atom_types[b, :n] = s.atom_types
         partial_charges[b, :n] = s.partial_charges

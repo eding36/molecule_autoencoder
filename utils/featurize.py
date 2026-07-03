@@ -1,28 +1,27 @@
 """
-Offline featurization of an arbitrary SMILES CSV → sharded `MolSample` lists.
+Featurization of a SMILES CSV → sharded `MolSample` lists.
 
-Works on any CSV with a SMILES column (default name `smiles`, override with `--smiles-col`). Supports a `--limit`
-flag for partial runs and an idempotent resume (counts existing shards and
-skips that many input rows).
+Works on any CSV with a SMILES column (default name `smiles`, override with `--smiles-col`). 
 
 For each SMILES:
-  1. RDKit parse + canonicalize + ETKDG conformer + MMFF optimize.
-  2. Atom features (32-D): one-hot atomic num (top-10) + formal charge +
+  1. RDKit parsing
+  2. canonicalize
+  3. Generate conformers with ETKDG, then optimize force field with MMFF.
+Outputs:
+1. Atom features (32-D): one-hot atomic num (top-10) + formal charge +
      hybridization one-hot + aromaticity + num H + chirality + in-ring.
-  3. Bond features (8-D): bond-type one-hot + stereo + in-ring + conjugated.
-  4. SE(3)-invariant 3D scalars: atom-type vector (16-D — atomic num + radii +
-     mass + degree + ring flags), bond lengths, bond angles (sparse triples),
-     dihedral angles (sparse quadruples — rotatable + ring torsions). Raw xyz
-     coordinates are used to derive these scalars and then discarded — the
-     model itself is coordinate-free.
-  5. Pharmacophore (8-D): donor, acceptor, aromatic, hydrophobic, +charge,
+2. Bond features (8-D): bond-type one-hot + stereo + in-ring + conjugated.
+3. SE(3)-invariant 3D features: atom-type vector (16-D — atomic num + radii +
+     mass + degree + ring flags), bond lengths, bond angles,
+     dihedral angles. Raw xyz
+     coordinates are used to calculate these scalars and then are discarded.
+4. Pharmacophore (8-D): donor, acceptor, aromatic, hydrophobic, +charge,
      -charge, halogen, ring.
-  6. Gasteiger partial charges (per atom).
-  7. Canonical SMILES string stored on the sample so the embedding pipeline can
-     recover molecule identity from shards without re-featurizing.
+5. Gasteiger partial charges (per atom).
+6. Canonical SMILES string
 
 Each shard is a .pt file containing a list of `MolSample` objects (sparse —
-no padding). The training-time DataLoader does the collate→dense step.
+no padding).
 
 CLI:
     python utils/featurize.py \
@@ -100,7 +99,7 @@ def atom_feature_vec(atom: Chem.Atom) -> np.ndarray:
 
 
 def atom_type_vec(atom: Chem.Atom) -> np.ndarray:
-    """16-D numeric atom-type vector (continuous, generalizes better than one-hot)."""
+    """16-D numeric atom-type vector (continuous)."""
     feat = np.zeros(ATYPE_DIM, dtype=np.float32)
     z = atom.GetAtomicNum()
     feat[0] = z / 50.0                                              # normalized atomic num
@@ -137,8 +136,8 @@ _FEAT_FACTORY: Optional[ChemicalFeatures.MolChemicalFeatureFactory] = None
 def get_factory():
     global _FEAT_FACTORY
     if _FEAT_FACTORY is None:
-        fdef = os.path.join(RDConfig.RDDataDir, "BaseFeatures.fdef")
-        _FEAT_FACTORY = ChemicalFeatures.BuildFeatureFactory(fdef)
+        fdef = os.path.join(RDConfig.RDDataDir, "BaseFeatures.fdef") 
+        _FEAT_FACTORY = ChemicalFeatures.BuildFeatureFactory(fdef) #Builds the pharmacophore feature indexes, which can be called later to fetch pharmacore features
     return _FEAT_FACTORY
 
 
@@ -150,17 +149,17 @@ def pharma_feature_matrix(mol: Chem.Mol) -> np.ndarray:
     factory = get_factory()
     label_map = {"Donor": 0, "Acceptor": 1, "Aromatic": 2, "Hydrophobe": 3,
                  "PosIonizable": 4, "NegIonizable": 5}
-    for f in factory.GetFeaturesForMol(mol):
-        col = label_map.get(f.GetFamily())
+    for f in factory.GetFeaturesForMol(mol): #Gets the specific pharmacophore features (donor, acceptor, aromatic, hydrophibc, posIonizable, negIonizable)
+        col = label_map.get(f.GetFamily()) #Column index corresponding to features
         if col is None:
             continue
         for aid in f.GetAtomIds():
             feat[aid, col] = 1.0
     for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() in (9, 17, 35, 53):
-            feat[atom.GetIdx(), 6] = 1.0
+        if atom.GetAtomicNum() in (9, 17, 35, 53): 
+            feat[atom.GetIdx(), 6] = 1.0 #containsHalogen column 
         if atom.IsInRing():
-            feat[atom.GetIdx(), 7] = 1.0
+            feat[atom.GetIdx(), 7] = 1.0 #if at least one atom isInRing 
     return feat
 
 
@@ -199,12 +198,12 @@ def compute_dihedrals(mol: Chem.Mol, coords: np.ndarray, max_torsions: int = 64)
                 i = i_atom.GetIdx()
                 if i == k:
                     continue
-                for l_atom in k_atom.GetNeighbors():
+                for l_atom in k_atom.GetNeighbors(): #4 for loops to find all dihedrals in the molecule (i,j,k,l)
                     l = l_atom.GetIdx()
-                    if l == j or l == i:
+                    if l == j or l == i: #avoid double counting
                         continue
                     quads.append((i, j, k, l))
-                    if len(quads) >= max_torsions:
+                    if len(quads) >= max_torsions: #to keep computation light
                         break
                 if len(quads) >= max_torsions:
                     break
@@ -212,15 +211,15 @@ def compute_dihedrals(mol: Chem.Mol, coords: np.ndarray, max_torsions: int = 64)
                 break
         if len(quads) >= max_torsions:
             break
-    if not quads:
+    if not quads: #if dihedrals don't exist, then return zeros
         return torch.zeros(4, 0, dtype=torch.long), torch.zeros(0)
     arr = np.array(quads)
-    p0, p1, p2, p3 = coords[arr[:, 0]], coords[arr[:, 1]], coords[arr[:, 2]], coords[arr[:, 3]]
-    b1, b2, b3 = p1 - p0, p2 - p1, p3 - p2
-    n1 = np.cross(b1, b2); n2 = np.cross(b2, b3)
+    p0, p1, p2, p3 = coords[arr[:, 0]], coords[arr[:, 1]], coords[arr[:, 2]], coords[arr[:, 3]] #fetch coords of all 4 atoms in dihedral
+    b1, b2, b3 = p1 - p0, p2 - p1, p3 - p2 #fetch bond lengths
+    n1 = np.cross(b1, b2); n2 = np.cross(b2, b3) #calculate planes that share central bond b2
     m1 = np.cross(n1, b2 / np.linalg.norm(b2, axis=-1, keepdims=True).clip(min=1e-6))
     x = (n1 * n2).sum(-1); y = (m1 * n2).sum(-1)
-    angles = np.arctan2(y, x)
+    angles = np.arctan2(y, x) 
     return torch.tensor(arr.T, dtype=torch.long), torch.tensor(angles, dtype=torch.float32)
 
 
@@ -233,9 +232,9 @@ def featurize_smiles(smiles: str, max_atoms: int = 64,
         return None
     canonical_smiles = Chem.MolToSmiles(mol)
     mol = Chem.AddHs(mol)
-    if mol.GetNumAtoms() > max_atoms:
-        return None
-    # Embed 3D conformer; bail if it fails.
+    if mol.GetNumAtoms() > max_atoms: #only featurize smiles with length < max_atoms
+        return None 
+    # Embed 3D conformer, abort if fails.
     if AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) < 0:
         return None
     try:
@@ -250,9 +249,9 @@ def featurize_smiles(smiles: str, max_atoms: int = 64,
     coords = mol.GetConformer().GetPositions().astype(np.float32)
 
     # Atom-level features
-    atom_feats = np.stack([atom_feature_vec(a) for a in mol.GetAtoms()])
-    atom_types = np.stack([atom_type_vec(a) for a in mol.GetAtoms()])
-    pharma = pharma_feature_matrix(mol)
+    atom_feats = np.stack([atom_feature_vec(a) for a in mol.GetAtoms()]) #fetch atom categorical feats
+    atom_types = np.stack([atom_type_vec(a) for a in mol.GetAtoms()]) #fetch atom continuous feats
+    pharma = pharma_feature_matrix(mol) #pharmacore matrix
     charges = np.array([float(a.GetProp("_GasteigerCharge")) if a.HasProp("_GasteigerCharge") else 0.0
                          for a in mol.GetAtoms()], dtype=np.float32)
     charges = np.nan_to_num(charges, nan=0.0, posinf=0.0, neginf=0.0)
@@ -264,11 +263,11 @@ def featurize_smiles(smiles: str, max_atoms: int = 64,
         bf = bond_feature_vec(bond)
         d = float(np.linalg.norm(coords[i] - coords[j]))
         for s, t in ((i, j), (j, i)):
-            src.append(s); dst.append(t)
+            src.append(s); dst.append(t) #bidirectional representation of bonds that feed into adjacency matrix
             bond_feats_list.append(bf); bond_lengths.append(d)
-    edge_index = torch.tensor([src, dst], dtype=torch.long) if src else torch.zeros(2, 0, dtype=torch.long)
+    edge_index = torch.tensor([src, dst], dtype=torch.long) if src else torch.zeros(2, 0, dtype=torch.long) #adjacency matrix
     bond_feats = torch.tensor(np.stack(bond_feats_list) if bond_feats_list else np.zeros((0, BOND_FEAT_DIM)),
-                               dtype=torch.float32)
+                               dtype=torch.float32) #tensor of all bond features for all bonds
     bond_lengths_t = torch.tensor(bond_lengths, dtype=torch.float32) if bond_lengths else torch.zeros(0)
 
     # Angles + dihedrals (derived scalars; coords themselves are not stored)
@@ -288,7 +287,7 @@ def featurize_smiles(smiles: str, max_atoms: int = 64,
         dihedral_index=dihedral_index,
         dihedral_angles=dihedral_angles,
         smiles=canonical_smiles,
-    )
+    ) #Return MolSample object which is essentially a featurized molecule
 
 
 # ---- CLI -------------------------------------------------------------------
@@ -309,11 +308,10 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    # ---- Resume support ----
-    # If shards already exist, count kept molecules and skip that many input
+
+    # If shards already exist, count kept molecules and skip that many inputs
     # rows (× ~1.01 to account for the small fraction dropped at featurize time).
-    # Resumes from `next_shard_id = len(existing)`; mild duplication of a few
-    # boundary molecules is harmless.
+    # Resumes from `next_shard_id = len(existing)`
     existing_shards = sorted(out.glob("shard_*.pt"))
     skip_rows = 0
     next_shard_id = 0
@@ -327,7 +325,7 @@ def main():
                f"{kept_so_far} kept; skipping first ~{skip_rows} input rows, "
                f"next shard_id={next_shard_id}")
 
-    # Stream smiles to keep memory low even at 250k rows.
+    # Stream smiles 
     with open(args.csv) as f:
         reader = csv.DictReader(f)
         rows = [r[args.smiles_col] for r in reader]
@@ -341,7 +339,7 @@ def main():
     shard: List[MolSample] = []
     shard_id, kept, dropped, t0 = next_shard_id, 0, 0, time.time()
 
-    if args.workers > 0:
+    if args.workers > 0: #parallel processing of featurization
         from multiprocessing import Pool
         worker_kwargs = dict(max_atoms=args.max_atoms, max_torsions=args.max_torsions)
         from functools import partial

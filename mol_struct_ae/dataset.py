@@ -29,7 +29,7 @@ def _index_cache_path(shard_dir: str, max_atoms: Optional[int]) -> str:
 
 
 class ShardedMolDataset(Dataset):
-    """Random-access view of all MolSamples across shards.
+    """Indexes all MolSamples across all shards for easy sampling.
 
     On first construction, builds an index `(shard_idx, local_idx)` for every
     sample passing the `max_atoms` filter, then caches it to a JSON sidecar so
@@ -41,13 +41,13 @@ class ShardedMolDataset(Dataset):
 
     def __init__(self, shard_dir: str, pattern: str = "shard_*.pt",
                   max_atoms: Optional[int] = None, use_cache: bool = True):
-        all_paths = sorted(glob.glob(os.path.join(shard_dir, pattern)))
+        all_paths = sorted(glob.glob(os.path.join(shard_dir, pattern))) #fetch all shards
         if not all_paths:
             raise FileNotFoundError(f"No shards matching {pattern} in {shard_dir}")
 
         cache_path = _index_cache_path(shard_dir, max_atoms)
         loaded_from_cache = False
-        if use_cache and os.path.isfile(cache_path):
+        if use_cache and os.path.isfile(cache_path): #try loading from cache using json file of all the cached shards
             try:
                 with open(cache_path) as f:
                     payload = json.load(f)
@@ -74,19 +74,20 @@ class ShardedMolDataset(Dataset):
                 try:
                     data = torch.load(path, map_location="cpu", weights_only=False)
                 except Exception as e:
-                    skipped_shards.append(f"{os.path.basename(path)} ({type(e).__name__}: {e})")
+                    skipped_shards.append(f"{os.path.basename(path)} ({type(e).__name__}: {e})") #append shard path to skipped shards if error
                     continue
-                shard_pos = len(self.shard_paths)
+                shard_pos = len(self.shard_paths) #shard index in all paths
                 self.shard_paths.append(path)
                 kept_in_shard = 0
                 for local_idx, sample in enumerate(data):
-                    if max_atoms is not None and sample.atom_feats_2d.shape[0] > max_atoms:
+                    if max_atoms is not None and sample.atom_feats_2d.shape[0] > max_atoms: #count how many shards are dropped due to max_atom violation
                         oversize_dropped += 1
                         continue
-                    self.index.append((shard_pos, local_idx))
+                    self.index.append((shard_pos, local_idx)) #append which shard and which molecule index to the total molecule indices
                     kept_in_shard += 1
                 valid_counts.append(kept_in_shard)
-                if (i + 1) % 200 == 0:
+                ###---Bookkeeping####
+                if (i + 1) % 200 == 0: 
                     print(f"[ShardedMolDataset] indexed {i+1}/{len(all_paths)} shards", flush=True)
             if skipped_shards:
                 print(f"[ShardedMolDataset] WARN skipped {len(skipped_shards)} unreadable shard(s):")
@@ -106,7 +107,7 @@ class ShardedMolDataset(Dataset):
                 except Exception as e:
                     print(f"[ShardedMolDataset] WARN could not write index cache: {e}")
 
-        self.total = len(self.index)
+        self.total = len(self.index) #total shards
         self._cache_path: Optional[str] = None
         self._cache_data: Optional[List[MolSample]] = None
 
@@ -120,17 +121,14 @@ class ShardedMolDataset(Dataset):
             self._cache_path = path
         return self._cache_data
 
-    def __getitem__(self, idx: int) -> MolSample:
+    def __getitem__(self, idx: int) -> MolSample: #fetches a single MolSample at a specified idx
         shard_idx, local_idx = self.index[idx]
         return self._load_shard(shard_idx)[local_idx]
 
 
 class ShardSequentialSampler(Sampler[int]):
-    """Yields dataset indices grouped by shard so the single-slot shard cache
-    stays warm. Shards are visited in a (per-epoch) shuffled order, and samples
-    inside each shard are shuffled too. Equivalent statistical mixing to global
-    shuffle (since featurization already cross-mixes molecules across shards),
-    at a fraction of the I/O cost.
+    """Returns randomized dataset indices grouped by shard. Shards are accessed in a shuffled order, and samples
+    inside each shard are shuffled too.
     """
 
     def __init__(self, dataset: ShardedMolDataset, shuffle: bool = True, seed: int = 0):
@@ -139,9 +137,9 @@ class ShardSequentialSampler(Sampler[int]):
         self.seed = seed
         self.epoch = 0
         # Group dataset indices by shard once at construction
-        by_shard: dict[int, List[int]] = {}
+        by_shard: dict[int, List[int]] = {} #keys = shard indices, values = dataset indices for each shard
         for ds_idx, (shard_idx, _) in enumerate(dataset.index):
-            by_shard.setdefault(shard_idx, []).append(ds_idx)
+            by_shard.setdefault(shard_idx, []).append(ds_idx) #for each molsample, populate a dictionary in which keys are the shard index of the molsample, and value is the molsample index itself
         self.shard_to_indices = by_shard
 
     def set_epoch(self, epoch: int) -> None:
@@ -149,24 +147,24 @@ class ShardSequentialSampler(Sampler[int]):
 
     def __iter__(self) -> Iterator[int]:
         g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-        shard_keys = list(self.shard_to_indices.keys())
-        if self.shuffle:
+        g.manual_seed(self.seed + self.epoch) #initialize random seed
+        shard_keys = list(self.shard_to_indices.keys()) #list of all molsample indices, ordered by shard index
+        if self.shuffle: #shuffle shard indices
             shard_keys = [shard_keys[i] for i in torch.randperm(len(shard_keys), generator=g).tolist()]
         for shard_idx in shard_keys:
-            indices = self.shard_to_indices[shard_idx]
-            if self.shuffle:
+            indices = self.shard_to_indices[shard_idx] #fetch molsample indices for specific shard index
+            if self.shuffle: #now shuffle molsample indices within this shard index
                 perm = torch.randperm(len(indices), generator=g).tolist()
                 for p in perm:
-                    yield indices[p]
+                    yield indices[p] #shuffled indices
             else:
-                yield from indices
+                yield from indices #unshuffled MolSamples AND shards
 
     def __len__(self) -> int:
         return self.dataset.total
 
 
-def make_collate_fn(max_atoms: int, max_dihedrals: int):
+def make_collate_fn(max_atoms: int, max_dihedrals: int): #padding op, sparse --> dense array
     def collate_fn(samples: List[MolSample]):
         return collate(samples, max_atoms=max_atoms, max_dihedrals=max_dihedrals)
     return collate_fn
