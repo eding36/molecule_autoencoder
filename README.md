@@ -1,5 +1,7 @@
 # mol_struct_ae
 
+An ML project with fruitful collaboration with Claude Code :D
+
 This README covers:
 1. [Overview](#overview)  
 2. [Architectures](#architectures)

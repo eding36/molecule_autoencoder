@@ -18,6 +18,7 @@ A `PairformerBlock` does, at each layer:
     5. single += SingleTransition(single)            # single MLP
 
 """
+
 from __future__ import annotations
 
 import math
